@@ -109,8 +109,15 @@ class TestPlayerAndAlbumView(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(msg, "")
 
-        # 3. FLAC format (unsupported by player rules)
+        # 3. FLAC is playable (decoded through FFmpeg)
         ok, msg = is_file_playable(str(self.flac_track))
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+
+        # 3b. Formats outside the library are rejected
+        ape_file = self.test_dir / "track.ape"
+        ape_file.write_bytes(b"dummy")
+        ok, msg = is_file_playable(str(ape_file))
         self.assertFalse(ok)
         self.assertIn("Unsupported format", msg)
 
@@ -139,7 +146,7 @@ class TestPlayerAndAlbumView(unittest.TestCase):
 
         ok = controller.play_album(album_data, tracks)
         self.assertTrue(ok)
-        self.assertEqual(len(controller.playlist), 2)  # only mp3 and m4a
+        self.assertEqual(len(controller.playlist), 3)  # mp3, m4a and flac
         self.assertEqual(controller.current_index, 0)
         self.assertEqual(controller.current_track["title"], "Alpha Track")
         self.assertEqual(len(started_events), 1)
@@ -194,7 +201,8 @@ class TestPlayerAndAlbumView(unittest.TestCase):
         self.assertEqual(view.artist_label.text(), "The Rockers")
         self.assertIn("2024", view.meta_label.text())
         self.assertIn("Rock", view.meta_label.text())
-        self.assertEqual(view.comment_label.text(), "Recorded live in 2024.")
+        self.assertIn("Commentary:", view.comment_label.text())
+        self.assertIn("Recorded live in 2024.", view.comment_label.text())
         self.assertFalse(view.comment_label.isHidden())
 
         # Verify tracks rendered

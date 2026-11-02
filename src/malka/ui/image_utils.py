@@ -118,6 +118,79 @@ def save_square_artist_image(source_path: Union[str, Path], dest_path: Union[str
         return False
 
 
+_TINTED_ICON_CACHE: Dict[Tuple[str, int, str], QIcon] = {}
+_EMOJI_ICON_CACHE: Dict[str, QIcon] = {}
+
+
+def _resource_candidates(filename: str) -> List[Path]:
+    candidates = [Path(sys.executable).parent / "resources" / filename]
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "resources" / filename)
+    candidates.extend([
+        Path(__file__).resolve().parents[3] / "resources" / filename,
+        Path.cwd() / "resources" / filename,
+    ])
+    return candidates
+
+
+def get_tinted_icon(filename: str, size: int = 18, theme: str = "dark") -> QIcon:
+    """Loads a black glyph and recolours it for the current theme.
+
+    Dark theme -> light glyph (inverted), light theme -> dark glyph.
+    Multiple DPR variants are embedded so the icon stays razor sharp.
+    """
+    key = (filename, size, theme)
+    if key in _TINTED_ICON_CACHE:
+        return _TINTED_ICON_CACHE[key]
+
+    # Match the "NOW PLAYING" caption: muted grey, not stark black/white.
+    color = (139, 148, 158) if theme != "light" else (101, 109, 118)
+    icon = QIcon()
+    for path in _resource_candidates(filename):
+        if not path.exists():
+            continue
+        try:
+            with Image.open(str(path)) as img:
+                base = img.convert("RGBA")
+                for dpr in (1.0, 1.25, 1.5, 2.0):
+                    target = max(1, int(round(size * dpr)))
+                    resized = base.resize((target, target), Image.Resampling.LANCZOS)
+                    resized_alpha = resized.split()[-1]
+                    tinted = Image.new("RGBA", resized.size, color + (255,))
+                    tinted.putalpha(resized_alpha)
+                    data = tinted.tobytes("raw", "RGBA")
+                    qimg = QImage(data, target, target, QImage.Format.Format_RGBA8888)
+                    pix = QPixmap.fromImage(qimg)
+                    pix.setDevicePixelRatio(dpr)
+                    icon.addPixmap(pix)
+        except Exception:
+            icon = QIcon()
+            continue
+        _TINTED_ICON_CACHE[key] = icon
+        return icon
+    _TINTED_ICON_CACHE[key] = icon
+    return icon
+
+
+def emoji_icon(emoji: str = "🎵", font_family: str = "Segoe UI Emoji") -> QIcon:
+    """Renders an emoji into a multi-resolution QIcon (used as the window icon)."""
+    if emoji in _EMOJI_ICON_CACHE:
+        return _EMOJI_ICON_CACHE[emoji]
+    icon = QIcon()
+    for px in (16, 24, 32, 48, 64, 128, 256):
+        pixmap = QPixmap(px, px)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setFont(QFont(font_family, int(px * 0.72)))
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
+        painter.end()
+        icon.addPixmap(pixmap)
+    _EMOJI_ICON_CACHE[emoji] = icon
+    return icon
+
+
 def get_resource_pixmap(filename: str, width: int = 24, height: int = 24, dpr: Optional[float] = None, theme: Optional[str] = None) -> QPixmap:
     """Finds and loads a scaled QPixmap using PIL Lanczos resampling with high-DPI awareness for razor-sharp rendering."""
     if dpr is None:
@@ -369,6 +442,24 @@ def _on_thumbnail_ready_main_thread(source_path_str: str, thumb_path_str: str, s
                 cb(source_path_str, pixmap)
             except Exception:
                 pass
+
+
+def resize_pixmap_lanczos(pixmap: QPixmap, width_px: int, height_px: int) -> QPixmap:
+    """Pixel-exact resize through PIL Lanczos (Qt only offers Smooth/Bilinear)."""
+    if pixmap.isNull() or width_px <= 0 or height_px <= 0:
+        return pixmap
+    try:
+        image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        raw = image.constBits().asstring(image.sizeInBytes())
+        pil = Image.frombytes("RGBA", (image.width(), image.height()), raw)
+        pil = pil.resize((width_px, height_px), Image.Resampling.LANCZOS)
+        data = pil.tobytes("raw", "RGBA")
+        qimg = QImage(data, width_px, height_px, QImage.Format.Format_RGBA8888)
+        out = QPixmap.fromImage(qimg)
+        out.setDevicePixelRatio(pixmap.devicePixelRatio() or 1.0)
+        return out
+    except Exception:
+        return pixmap
 
 
 def get_cached_square_pixmap(

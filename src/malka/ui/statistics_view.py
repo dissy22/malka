@@ -14,6 +14,7 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QCompleter,
     QFrame,
     QHBoxLayout,
@@ -119,21 +120,26 @@ class StatBarRow(QFrame):
         self._load_thumbnail()
         layout.addWidget(self.thumb_lbl)
 
-        # Title & Subtitle block
-        text_block = QVBoxLayout()
+        # Title & Subtitle block — fixed width so the bars line up on every row.
+        text_widget = QWidget()
+        text_widget.setFixedWidth(330)
+        text_block = QVBoxLayout(text_widget)
         text_block.setContentsMargins(0, 0, 0, 0)
         text_block.setSpacing(2)
 
-        self.title_lbl = QLabel(self._get_title())
+        self.title_lbl = QLabel()
         self.title_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.title_lbl.setFixedWidth(330)
+        self.title_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         text_block.addWidget(self.title_lbl)
 
-        self.sub_lbl = QLabel(self._get_subtitle())
+        self.sub_lbl = QLabel()
         self.sub_lbl.setFont(QFont("Segoe UI", 8))
+        self.sub_lbl.setFixedWidth(330)
         text_block.addWidget(self.sub_lbl)
 
-        layout.addLayout(text_block, 2)
+        self._set_elided_texts()
+        layout.addWidget(text_widget, 0)
 
         # Horizontal Bar container
         self.bar_widget = HorizontalBarWidget(
@@ -171,6 +177,25 @@ class StatBarRow(QFrame):
             """)
             layout.addWidget(self.pin_badge)
 
+    def _set_elided_texts(self):
+        title = self._get_title()
+        subtitle = self._get_subtitle()
+        metrics_title = self.title_lbl.fontMetrics()
+        metrics_sub = self.sub_lbl.fontMetrics()
+        self.title_lbl.setText(metrics_title.elidedText(title, Qt.TextElideMode.ElideRight, 320))
+        self.title_lbl.setToolTip(title)
+        self.sub_lbl.setText(metrics_sub.elidedText(subtitle, Qt.TextElideMode.ElideRight, 320))
+        self.sub_lbl.setToolTip(subtitle)
+
+    @staticmethod
+    def _initials(name: str) -> str:
+        words = [w for w in str(name or "").split() if w]
+        if not words:
+            return "🎤"
+        if len(words) == 1:
+            return words[0][:2].upper()
+        return (words[0][0] + words[-1][0]).upper()
+
     def _get_title(self) -> str:
         if self.item_type == "artist":
             return self.item_data.get("artist_name", "Unknown Artist")
@@ -201,7 +226,16 @@ class StatBarRow(QFrame):
             return "#bc8cff" if self.val_unit == "tracks" else "#f0883e"
 
     def _load_thumbnail(self):
-        img_p = self.item_data.get("image_path") or self.item_data.get("cover_path") or self.item_data.get("sample_cover")
+        if self.item_type == "artist":
+            # Artists must never borrow an album cover: use their own image or
+            # the initials placeholder.
+            img_p = self.item_data.get("image_path") or None
+        else:
+            img_p = (
+                self.item_data.get("image_path")
+                or self.item_data.get("cover_path")
+                or self.item_data.get("sample_cover")
+            )
         self._thumb_source = img_p
         pix = get_cached_square_pixmap(img_p, size=40, radius_top=6) if img_p else None
 
@@ -229,38 +263,41 @@ class StatBarRow(QFrame):
 
     def _round_pixmap(self, src: QPixmap, size: int, is_circle: bool = False) -> QPixmap:
         # Cached thumbnails already carry a devicePixelRatio (usually 2.0).
-        # Scale in physical pixels, otherwise a 40 px avatar is drawn at 20 px
-        # (a quarter of its allocated QLabel area).
+        # Scale in physical pixels with Lanczos, otherwise a 40 px avatar is
+        # drawn at 20 px (a quarter of its allocated QLabel area).
+        from malka.ui.image_utils import resize_pixmap_lanczos
+
         dpr = src.devicePixelRatio() or 1.0
         target_px = max(1, int(round(size * dpr)))
-        scaled = src.scaled(
-            target_px, target_px,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        cropped = scaled.copy(
-            (scaled.width() - target_px) // 2,
-            (scaled.height() - target_px) // 2,
-            target_px, target_px,
-        )
+        scaled = resize_pixmap_lanczos(src, target_px, target_px) if (
+            src.width() != target_px or src.height() != target_px
+        ) else src
+        cropped = scaled
 
         dest = QPixmap(target_px, target_px)
         dest.setDevicePixelRatio(dpr)
         dest.fill(Qt.GlobalColor.transparent)
         painter = QPainter(dest)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Logical coordinates: the canvas is target_px physical, size logical.
         path = QPainterPath()
         if is_circle:
-            path.addEllipse(0, 0, target_px, target_px)
+            path.addEllipse(0, 0, size, size)
         else:
-            path.addRoundedRect(0, 0, target_px, target_px, 6 * dpr, 6 * dpr)
+            path.addRoundedRect(0, 0, size, size, 6, 6)
         painter.setClipPath(path)
         painter.drawPixmap(0, 0, cropped)
         painter.end()
         return dest
 
     def _create_placeholder(self, size: int) -> QPixmap:
-        dest = QPixmap(size, size)
+        # Draw at the physical resolution of the screen, otherwise the avatar is
+        # upscaled by Qt and looks blurry on HiDPI displays.
+        app = QApplication.instance()
+        dpr = app.primaryScreen().devicePixelRatio() if (app and app.primaryScreen()) else 1.0
+        target = max(1, int(round(size * dpr)))
+        dest = QPixmap(target, target)
+        dest.setDevicePixelRatio(dpr)
         dest.fill(Qt.GlobalColor.transparent)
         painter = QPainter(dest)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -269,6 +306,8 @@ class StatBarRow(QFrame):
         bg_col = QColor("#eaeef2" if is_light else "#21262d")
         text_col = QColor("#57606a" if is_light else "#8b949e")
 
+        # Painting happens in logical coordinates; the pixmap itself carries
+        # the device pixel ratio, so the 40 px avatar is rendered at 80 px.
         path = QPainterPath()
         if self.item_type == "artist":
             path.addEllipse(0, 0, size, size)
@@ -276,16 +315,18 @@ class StatBarRow(QFrame):
             path.addRoundedRect(0, 0, size, size, 6, 6)
         painter.fillPath(path, bg_col)
 
-        # Draw icon or first letter
+        # Draw icon, initials (artists) or the first letter.
         title = self._get_title()
         symbol = title[0].upper() if title else "?"
         if self.item_type == "genre":
             symbol = "🎸"
         elif self.item_type == "album":
             symbol = "💿"
+        elif self.item_type == "artist":
+            symbol = self._initials(title)
 
         painter.setPen(text_col)
-        painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        painter.setFont(QFont("Segoe UI", 10 if self.item_type == "artist" else 12, QFont.Weight.Bold))
         painter.drawText(0, 0, size, size, Qt.AlignmentFlag.AlignCenter, symbol)
         painter.end()
         return dest
@@ -708,6 +749,11 @@ class StatRankView(QWidget):
             item = l.takeAt(0)
             w = item.widget()
             if w:
+                # Hide immediately: deleteLater() is only processed when control
+                # returns to the event loop, and a stale widget would otherwise
+                # keep painting on top of the freshly created rows.
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
     def _refresh_rows(self):

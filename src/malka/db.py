@@ -155,7 +155,8 @@ def init_db(db_path: str) -> None:
                 cover_cache_path TEXT,
                 mtime REAL NOT NULL DEFAULT 0,
                 duration REAL NOT NULL DEFAULT 0.0,
-                bad_encoding INTEGER NOT NULL DEFAULT 0
+                bad_encoding INTEGER NOT NULL DEFAULT 0,
+                is_organized INTEGER NOT NULL DEFAULT 0
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_album_artist ON tracks(album, album_artist)")
@@ -177,6 +178,16 @@ def init_db(db_path: str) -> None:
             cursor.execute("ALTER TABLE tracks ADD COLUMN bad_encoding INTEGER NOT NULL DEFAULT 0")
         if "comment" not in cols:
             cursor.execute("ALTER TABLE tracks ADD COLUMN comment TEXT NOT NULL DEFAULT ''")
+        # These columns belonged to a short-lived experiment; stream info is now
+        # read from the file on demand, so clean them up in existing databases.
+        for stale_column in ("sample_rate", "bits_per_sample", "channels", "bitrate"):
+            if stale_column in cols:
+                try:
+                    cursor.execute(f"ALTER TABLE tracks DROP COLUMN {stale_column}")
+                except Exception:
+                    pass
+        if "is_organized" not in cols:
+            cursor.execute("ALTER TABLE tracks ADD COLUMN is_organized INTEGER NOT NULL DEFAULT 0")
 
         # Staging table for album imports
         conn.execute("""
@@ -246,15 +257,18 @@ def upsert_track(conn: sqlite3.Connection, track: Dict[str, Any]) -> None:
     data.setdefault("compilation", 0)
     data.setdefault("duration", 0.0)
     data.setdefault("bad_encoding", 0)
+    data.setdefault("is_organized", 0)
     data.setdefault("comment", "")
 
     conn.execute("""
         INSERT INTO tracks (
             file_path, title, artist, album_artist, album, year, genre, comment,
-            track_no, disc_no, disc_total, compilation, has_cover, cover_cache_path, mtime, duration, bad_encoding
+            track_no, disc_no, disc_total, compilation, has_cover, cover_cache_path, mtime, duration,
+            bad_encoding, is_organized
         ) VALUES (
             :file_path, :title, :artist, :album_artist, :album, :year, :genre, :comment,
-            :track_no, :disc_no, :disc_total, :compilation, :has_cover, :cover_cache_path, :mtime, :duration, :bad_encoding
+            :track_no, :disc_no, :disc_total, :compilation, :has_cover, :cover_cache_path, :mtime, :duration,
+            :bad_encoding, :is_organized
         )
         ON CONFLICT(file_path) DO UPDATE SET
             title = excluded.title,
@@ -272,7 +286,8 @@ def upsert_track(conn: sqlite3.Connection, track: Dict[str, Any]) -> None:
             cover_cache_path = excluded.cover_cache_path,
             mtime = excluded.mtime,
             duration = excluded.duration,
-            bad_encoding = excluded.bad_encoding
+            bad_encoding = excluded.bad_encoding,
+            is_organized = excluded.is_organized
     """, data)
 
 
@@ -309,7 +324,8 @@ def get_all_albums(conn: sqlite3.Connection, sort_mode: str = "artist_year") -> 
             MAX(CAST(disc_total AS INTEGER)) as max_disc_total,
             COUNT(DISTINCT disc_no) as disc_count,
             MAX(compilation) as is_compilation,
-            MAX(bad_encoding) as has_bad_encoding
+            MAX(bad_encoding) as has_bad_encoding,
+            MIN(is_organized) as all_organized
         FROM tracks t1
         GROUP BY album, album_artist
         ORDER BY 
@@ -339,6 +355,7 @@ def get_all_albums(conn: sqlite3.Connection, sort_mode: str = "artist_year") -> 
             "disc_count": disc_cnt,
             "is_compilation": bool(row["is_compilation"]),
             "has_bad_encoding": bool(row["has_bad_encoding"]),
+            "is_organized": bool(row["all_organized"]),
         })
     return sort_albums(albums, mode=sort_mode)
 
@@ -372,6 +389,13 @@ def update_track(conn: sqlite3.Connection, track_id: int, data: Dict[str, Any]) 
 
 def update_file_path(conn: sqlite3.Connection, track_id: int, new_path: str) -> None:
     conn.execute("UPDATE tracks SET file_path = ? WHERE id = ?", (new_path, track_id))
+
+
+def set_track_organized(conn: sqlite3.Connection, track_id: int, organized: int) -> None:
+    try:
+        conn.execute("UPDATE tracks SET is_organized = ? WHERE id = ?", (1 if organized else 0, int(track_id)))
+    except Exception:
+        pass
 
 
 def delete_missing_tracks(conn: sqlite3.Connection, existing_paths: set) -> int:

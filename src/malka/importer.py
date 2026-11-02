@@ -1,6 +1,16 @@
 """
 Album import engine for Malka.
-Handles Variant 1 (direct MP3/M4A/FLAC files) and Variant 2 (FLAC + CUE image conversion via QAAC).
+
+Every import is resolved to one of four source kinds (see :mod:`malka.formats`)
+and to a quality mode picked by the user:
+
+* ``copy``              — keep the audio stream untouched (image albums are only split);
+* ``lossy``             — encode to MP3 320 or AAC 224, down to the chosen ceiling;
+* ``lossless_resample`` — encode to FLAC/ALAC, 16-bit, down to the chosen ceiling;
+* ``hires``             — keep the original Hi-Res resolution, re-encode to FLAC/ALAC
+                          (only needed for APE/WavPack images).
+
+Nothing is ever upsampled or upscaled.
 """
 import os
 import re
@@ -28,12 +38,28 @@ from malka.cue import (
 )
 from malka.db import (
     clear_import_tracks,
-    get_connection,
     get_import_tracks,
     insert_import_track,
     upsert_track,
 )
-from malka.organizer import format_track_filename, is_album_ready_to_organize, sanitize_filename
+from malka.formats import (
+    DEFAULT_RATE,
+    IMAGE_SOURCE_EXTS,
+    IMPORT_SOURCE_EXTS,
+    MODE_COPY,
+    SOURCE_KIND_FLAC_ALAC,
+    SOURCE_KIND_IMAGE_APE_WV,
+    SOURCE_KIND_IMAGE_FLAC_ALAC,
+    SOURCE_KIND_MP3_M4A,
+    encoder_args,
+    format_extension,
+    format_from_extension,
+    is_hires,
+    is_lossless_source,
+    normalize_settings,
+    plan_for,
+)
+from malka.organizer import format_track_filename, is_track_organized, sanitize_filename
 from malka.tags import (
     detect_and_fix_encoding,
     find_folder_artwork,
@@ -43,13 +69,14 @@ from malka.tags import (
     write_tags,
 )
 
-AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".mp4", ".flac", ".wv", ".ape"}
-LOSSLESS_IMAGE_EXTS = {".flac", ".wv", ".ape"}
+#: Files the importer accepts, by kind. APE/WavPack never enter the library.
+AUDIO_EXTENSIONS = IMPORT_SOURCE_EXTS
+LOSSLESS_IMAGE_EXTS = IMAGE_SOURCE_EXTS
 
 
 @dataclass
 class ImportAnalysisResult:
-    variant: int  # 1 (direct audio files) or 2 (FLAC + CUE conversion)
+    variant: int  # 1 (lossy tracks) / 2 (image + CUE) / 3 (lossless tracks)
     album: str
     album_artist: str
     year: str
@@ -63,8 +90,47 @@ class ImportAnalysisResult:
     cue_file_path: Optional[str] = None
     sample_rate: int = 44100
     bits_per_sample: int = 16
-    target_sample_rate: Optional[int] = None
     tracks: List[Dict[str, Any]] = field(default_factory=list)
+    #: One of malka.formats.SOURCE_KINDS — selects the remembered import settings.
+    source_kind: str = SOURCE_KIND_MP3_M4A
+    #: Quality mode: copy / lossy / lossless_resample / hires.
+    mode: str = MODE_COPY
+    #: Chosen codec for modes that allow a choice ("" keeps the source format).
+    output_format: str = ""
+    #: Resampling ceiling picked by the user (44.1 or 48 kHz).
+    target_rate: int = DEFAULT_RATE
+    #: True when the source is above 48 kHz and/or 16-bit.
+    is_hires: bool = False
+    #: True when the album is a single image + CUE and must be split.
+    is_image_source: bool = False
+    #: flac / alac / mp3 / m4a — the format of the source audio.
+    source_format: str = ""
+    #: Channel count of the source audio (only stereo is supported).
+    channels: int = 2
+
+    def __post_init__(self):
+        # Keep hand-built analyses (tests, scripts) consistent with the format rules.
+        if self.variant == 2:
+            self.is_image_source = True
+            ext = Path(self.source_flac_path or "").suffix.lower()
+            if self.source_kind == SOURCE_KIND_MP3_M4A:
+                self.source_kind = (
+                    SOURCE_KIND_IMAGE_APE_WV if ext in (".ape", ".wv") else SOURCE_KIND_IMAGE_FLAC_ALAC
+                )
+            if not self.source_format:
+                self.source_format = format_from_extension(ext)
+        elif self.variant == 3 and self.source_kind == SOURCE_KIND_MP3_M4A:
+            self.source_kind = SOURCE_KIND_FLAC_ALAC
+
+        self.is_hires = self.is_hires or is_hires(self.sample_rate, self.bits_per_sample)
+        settings = normalize_settings(
+            self.source_kind,
+            self.is_hires,
+            {"mode": self.mode, "format": self.output_format, "rate": self.target_rate},
+        )
+        self.mode = settings["mode"]
+        self.output_format = settings["format"]
+        self.target_rate = settings["rate"]
 
 
 def get_codecs_dir() -> Path:
@@ -85,59 +151,6 @@ def get_codecs_dir() -> Path:
     if cand.is_dir():
         return cand
     return exe_codecs if getattr(sys, "frozen", False) else pkg_root / "codecs"
-
-
-def find_qaac_executable() -> Optional[Path]:
-    """
-    Finds qaac64.exe in codecs/qaac/ (Windows only).
-    Note: qaac/ in root is removed as requested; only codecs/qaac/ is supported.
-    """
-    import sys
-    if sys.platform != "win32":
-        return None
-
-    candidates = [
-        get_codecs_dir() / "qaac" / "qaac64.exe",
-        Path(sys.executable).parent / "codecs" / "qaac" / "qaac64.exe",
-        Path.cwd() / "codecs" / "qaac" / "qaac64.exe",
-    ]
-    for cand in candidates:
-        try:
-            if cand.exists() and cand.is_file():
-                return cand.resolve()
-        except (OSError, PermissionError):
-            continue
-
-    return None
-
-
-def find_flac_executable() -> Optional[Path]:
-    """Finds flac executable in codecs/flac or on system PATH."""
-    import sys
-    from shutil import which
-    flac_name = "flac.exe" if sys.platform == "win32" else "flac"
-
-    candidates = [
-        get_codecs_dir() / "flac" / flac_name,
-        Path(sys.executable).parent / "codecs" / "flac" / flac_name,
-        Path.cwd() / "codecs" / "flac" / flac_name,
-    ]
-    for cand in candidates:
-        try:
-            if cand.exists() and cand.is_file():
-                if sys.platform != "win32":
-                    try:
-                        cand.chmod(0o755)
-                    except Exception:
-                        pass
-                return cand.resolve()
-        except (OSError, PermissionError):
-            continue
-
-    found = which("flac")
-    if found:
-        return Path(found).resolve()
-    return None
 
 
 def find_ffmpeg_executable() -> Optional[Path]:
@@ -229,59 +242,6 @@ def find_ffmpeg_executable() -> Optional[Path]:
     return None
 
 
-def get_audio_encoder(source_ext: Optional[str] = None) -> Tuple[Optional[str], Optional[Path]]:
-    """
-    Determines audio encoder to use:
-    - On Windows, if codecs/qaac/ contains qaac64.exe, QAAC is used.
-      (FFmpeg acts as the stream decoder when needed, e.g. for .wv/.ape).
-    - Otherwise, FFmpeg is used across all platforms.
-    Returns (encoder_type, executable_path).
-    """
-    import sys
-    ffmpeg = find_ffmpeg_executable()
-
-    if sys.platform == "win32":
-        qaac = find_qaac_executable()
-        if qaac:
-            return "qaac", qaac
-        if ffmpeg:
-            return "ffmpeg", ffmpeg
-        return None, None
-    else:
-        if ffmpeg:
-            return "ffmpeg", ffmpeg
-        return None, None
-
-
-def get_audio_encoder_label(source_ext: Optional[str] = None) -> str:
-    """Returns a user-friendly label of the current encoder and settings."""
-    enc_type, _ = get_audio_encoder(source_ext)
-    if enc_type == "qaac":
-        return "QAAC (-v 224 kbps AAC)"
-    if enc_type == "ffmpeg":
-        return "FFmpeg native AAC (-c:a aac -b:a 224k)"
-    return "FFmpeg / QAAC (not found)"
-
-
-
-def compute_resampling_rate(source_sample_rate: int) -> Optional[int]:
-    """
-    Computes QAAC output sample rate according to rules:
-    - 44.1 kHz (44100) or 48 kHz (48000) -> None (keep as is)
-    - Above 48 kHz (> 48000):
-        If divisible by 44100 (e.g. 88200, 176400) -> 44100
-        If divisible by 48000 (e.g. 96000, 192000) -> 48000
-        Else -> 44100
-    """
-    if source_sample_rate <= 48000:
-        return None
-    if source_sample_rate % 44100 == 0:
-        return 44100
-    if source_sample_rate % 48000 == 0:
-        return 48000
-    return 44100
-
-
 def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
     """
     Analyzes an album directory dropped or selected for import.
@@ -294,7 +254,13 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
     # Gather files
     all_files = [f for f in folder.rglob("*") if f.is_file()]
     audio_files = [f for f in all_files if f.suffix.lower() in AUDIO_EXTENSIONS]
-    lossless_files = [f for f in all_files if f.suffix.lower() in LOSSLESS_IMAGE_EXTS]
+    # Lossless "album images" may also be ALAC inside an .m4a container.
+    lossless_files = [
+        f
+        for f in all_files
+        if f.suffix.lower() in LOSSLESS_IMAGE_EXTS
+        or (f.suffix.lower() == ".m4a" and is_lossless_source(str(f)))
+    ]
     cue_files = [f for f in all_files if f.suffix.lower() == ".cue"]
     m3u_files = [f for f in all_files if f.suffix.lower() in (".m3u", ".m3u8")]
 
@@ -377,11 +343,27 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
             stream_info = get_audio_stream_info(str(chosen_flac_path))
             sample_rate = stream_info.get("sample_rate", 44100)
             bits_per_sample = stream_info.get("bits_per_sample", 16)
-            target_sr = compute_resampling_rate(sample_rate)
+            channels = int(stream_info.get("channels") or 2)
+            if channels != 2:
+                raise ValueError(
+                    f"Only 2-channel (stereo) audio is supported: "
+                    f"'{Path(chosen_flac_path).name}' has {channels} channels."
+                )
+
+            # CUE sheets often omit REM DATE/GENRE. Fall back to the tags of the
+            # source image so the user does not have to retype them.
+            source_tags = read_tags(str(chosen_flac_path))
+            if cue_album.year in ("", NO_DATA) and source_tags.get("year") not in ("", NO_DATA):
+                cue_album.year = source_tags["year"]
+            if cue_album.genre in ("", NO_DATA) and source_tags.get("genre") not in ("", NO_DATA):
+                cue_album.genre = source_tags["genre"]
+            if cue_album.album in ("", NO_DATA) and source_tags.get("album") not in ("", NO_DATA):
+                cue_album.album = source_tags["album"]
+            if cue_album.album_artist in ("", NO_DATA) and source_tags.get("album_artist") not in ("", NO_DATA):
+                cue_album.album_artist = source_tags["album_artist"]
 
             # If cover is not found in folder, try extracting embedded picture from source audio
             if not cover_cache:
-                source_tags = read_tags(str(chosen_flac_path))
                 if source_tags.get("has_cover"):
                     cover_cache = source_tags.get("cover_cache_path", "")
 
@@ -415,6 +397,14 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
                 insert_import_track(db_conn, track_data)
 
             staged_tracks = get_import_tracks(db_conn)
+            image_ext = Path(chosen_flac_path).suffix.lower()
+            source_kind = (
+                SOURCE_KIND_IMAGE_APE_WV
+                if image_ext in (".ape", ".wv")
+                else SOURCE_KIND_IMAGE_FLAC_ALAC
+            )
+            hires = is_hires(sample_rate, bits_per_sample)
+            settings = normalize_settings(source_kind, hires, config.get_import_settings(source_kind))
             return ImportAnalysisResult(
                 variant=2,
                 album=cue_album.album,
@@ -430,8 +420,15 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
                 cue_file_path=str(chosen_cue_path),
                 sample_rate=sample_rate,
                 bits_per_sample=bits_per_sample,
-                target_sample_rate=target_sr,
                 tracks=staged_tracks,
+                source_kind=source_kind,
+                mode=settings["mode"],
+                output_format=settings["format"],
+                target_rate=settings["rate"],
+                is_hires=hires,
+                source_format=format_from_extension(image_ext),
+                channels=channels,
+                is_image_source=True,
             )
 
     # ------------------ Process Variant 1 (Direct files) ------------------
@@ -445,8 +442,17 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
         stream_info = get_audio_stream_info(str(f))
         t["sample_rate"] = stream_info.get("sample_rate", 44100)
         t["bits_per_sample"] = stream_info.get("bits_per_sample", 16)
+        t["channels"] = int(stream_info.get("channels") or 2)
         t["duration"] = stream_info.get("duration", 0.0)
         read_list.append(t)
+
+    # Malka only supports stereo music.
+    for t in read_list:
+        if int(t.get("channels") or 2) != 2:
+            raise ValueError(
+                f"Only 2-channel (stereo) audio is supported: "
+                f"'{Path(t['file_path']).name}' has {t['channels']} channels."
+            )
 
     # Sort tracks by disc_no, track_no, filename
     def _sort_key(item):
@@ -526,18 +532,32 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
 
     staged_tracks = get_import_tracks(db_conn)
 
-    # Determine if files contain any lossless audio (.flac, .wv, .ape) -> Variant 3 (Track-by-track conversion)
-    has_convertible = any(Path(t["file_path"]).suffix.lower() in LOSSLESS_IMAGE_EXTS for t in read_list)
-    variant = 3 if has_convertible else 1
+    # Any FLAC/ALAC track makes the album "lossless": those tracks may be
+    # converted, while MP3/AAC tracks in the same folder are always copied.
+    has_lossless = any(is_lossless_source(t["file_path"]) for t in read_list)
+    variant = 3 if has_lossless else 1
+    source_kind = SOURCE_KIND_FLAC_ALAC if has_lossless else SOURCE_KIND_MP3_M4A
+
+    # The exact source format (for display and for "keep original" imports).
+    suffixes = {Path(t["file_path"]).suffix.lower() for t in read_list}
+    if len(suffixes) == 1:
+        only_ext = next(iter(suffixes))
+        source_format = format_from_extension(only_ext)
+        if only_ext == ".m4a" and has_lossless:
+            source_format = "alac"
+    else:
+        source_format = "mixed"
 
     dominant_sr = read_list[0].get("sample_rate", 44100) if read_list else 44100
     dominant_bits = read_list[0].get("bits_per_sample", 16) if read_list else 16
     for t in read_list:
         if t.get("sample_rate", 44100) > dominant_sr:
             dominant_sr = t.get("sample_rate", 44100)
-            dominant_bits = t.get("bits_per_sample", 16)
+        if t.get("bits_per_sample", 0) > dominant_bits:
+            dominant_bits = t.get("bits_per_sample", 0)
 
-    target_sr = compute_resampling_rate(dominant_sr) if variant == 3 else None
+    hires = is_hires(dominant_sr, dominant_bits)
+    settings = normalize_settings(source_kind, hires, config.get_import_settings(source_kind))
 
     return ImportAnalysisResult(
         variant=variant,
@@ -554,9 +574,168 @@ def analyze_import_folder(folder_path: str, db_conn) -> ImportAnalysisResult:
         cue_file_path=None,
         sample_rate=dominant_sr,
         bits_per_sample=dominant_bits,
-        target_sample_rate=target_sr,
         tracks=staged_tracks,
+        source_kind=source_kind,
+        mode=settings["mode"],
+        output_format=settings["format"],
+        target_rate=settings["rate"],
+        is_hires=hires,
+        source_format=source_format,
+        channels=2,
+        is_image_source=False,
     )
+
+
+def _destination_dir(lib_dir: Path, track: Dict[str, Any], is_multi_disc: bool) -> Path:
+    """<Library>/<Album Artist>/<Year> - <Album>[/CD n]"""
+    album_artist_folder = sanitize_filename(track.get("album_artist", "Unknown Artist"))
+    year_str = sanitize_filename(track.get("year", "Unknown Year"))
+    album_str = sanitize_filename(track.get("album", "Unknown Album"))
+    album_folder = f"{year_str} - {album_str}"
+    if is_multi_disc:
+        disc_num = str(track.get("disc_no", "1")).strip() or "1"
+        return lib_dir / album_artist_folder / album_folder / f"CD {disc_num}"
+    return lib_dir / album_artist_folder / album_folder
+
+
+def _cue_slice(track: Dict[str, Any], next_track: Optional[Dict[str, Any]], fallback_start: str) -> Tuple[float, Optional[float]]:
+    """Returns (start_seconds, duration_seconds_or_None) for a CUE track."""
+    start_str = track.get("index01") or fallback_start or "00:00:00"
+    start = cue_time_to_seconds(start_str)
+    duration: Optional[float] = None
+    if next_track is not None:
+        next_str = next_track.get("index00") or next_track.get("index01") or ""
+        next_start = cue_time_to_seconds(next_str)
+        if next_start > start:
+            duration = next_start - start
+    return start, duration
+
+
+def _job_plan(
+    analysis: ImportAnalysisResult,
+    settings: Dict[str, Any],
+    source_format: str,
+    source_rate: int,
+    source_bits: int,
+) -> Dict[str, Any]:
+    return plan_for(
+        analysis.source_kind,
+        bool(analysis.is_hires),
+        settings,
+        source_format or analysis.source_format or "flac",
+        source_rate or analysis.sample_rate,
+        source_bits or analysis.bits_per_sample,
+    )
+
+
+def _build_import_jobs(
+    analysis: ImportAnalysisResult,
+    edited_tracks: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Resolves every edited track to a source, an optional CUE slice and a plan."""
+    jobs: List[Dict[str, Any]] = []
+
+    if analysis.variant == 2:
+        cue_path = Path(analysis.cue_file_path) if analysis.cue_file_path else None
+        cue_tracks = []
+        if cue_path and cue_path.is_file():
+            cue_album = parse_cue_file(cue_path)
+            cue_tracks = cue_album.tracks if cue_album else []
+
+        source = Path(analysis.source_flac_path) if analysis.source_flac_path else None
+        if (not source or not source.exists()) and cue_path:
+            for ext in (".flac", ".wv", ".ape", ".m4a"):
+                matches = sorted(cue_path.parent.glob(f"*{ext}"))
+                if matches:
+                    source = matches[0]
+                    break
+        if not source or not source.exists():
+            raise ValueError(
+                f"Source audio file (.flac, .wv, .ape) not found for CUE: {analysis.cue_file_path}"
+            )
+
+        plan = _job_plan(
+            analysis,
+            settings,
+            analysis.source_format or format_from_extension(source.suffix),
+            analysis.sample_rate,
+            analysis.bits_per_sample,
+        )
+        for idx, track in enumerate(edited_tracks):
+            fallback = cue_tracks[idx].index01 if idx < len(cue_tracks) else ""
+            start, duration = _cue_slice(
+                track,
+                edited_tracks[idx + 1] if idx + 1 < len(edited_tracks) else None,
+                fallback,
+            )
+            jobs.append({
+                "idx": idx,
+                "track": track,
+                "src": source,
+                "start": start,
+                "duration": duration,
+                "plan": plan,
+                # An image album always needs FFmpeg: either to split or to encode.
+                "use_ffmpeg": True,
+            })
+        return jobs
+
+    for idx, track in enumerate(edited_tracks):
+        src = Path(track.get("source_path") or track.get("file_path") or "")
+        source_format = format_from_extension(src.suffix)
+        sample_rate = int(track.get("sample_rate") or 0)
+        bits = int(track.get("bits_per_sample") or 0)
+        if sample_rate <= 0 or bits <= 0:
+            info = get_audio_stream_info(str(src))
+            sample_rate = int(info.get("sample_rate") or 44100)
+            bits = int(info.get("bits_per_sample") or 16)
+
+        # Only lossless sources can be re-encoded; MP3/AAC are always copied.
+        can_encode = is_lossless_source(str(src))
+        plan = _job_plan(analysis, settings, source_format, sample_rate, bits)
+        if not can_encode:
+            plan = {
+                "split": False,
+                "copy_stream": True,
+                "output_format": source_format,
+                "target_rate": None,
+                "reduce_bits": False,
+            }
+        jobs.append({
+            "idx": idx,
+            "track": track,
+            "src": src,
+            "start": 0.0,
+            "duration": None,
+            "plan": plan,
+            "use_ffmpeg": not plan["copy_stream"],
+        })
+    return jobs
+
+
+def _ffmpeg_command(ffmpeg: Path, job: Dict[str, Any], out_file: Path) -> List[str]:
+    plan = job["plan"]
+    cmd = [str(ffmpeg), "-nostdin", "-y", "-loglevel", "error"]
+    if job["start"] and job["start"] > 0:
+        cmd += ["-ss", f"{job['start']:.3f}"]
+    cmd += ["-i", str(job["src"])]
+    if job["duration"]:
+        cmd += ["-t", f"{job['duration']:.3f}"]
+    cmd += ["-vn", "-map", "0:a:0"]
+    if plan["copy_stream"]:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += encoder_args(plan["output_format"], plan["target_rate"], plan["reduce_bits"])
+    cmd.append(str(out_file))
+    return cmd
+
+
+def _planned_extension(job: Dict[str, Any]) -> str:
+    plan = job["plan"]
+    if plan["copy_stream"]:
+        return job["src"].suffix.lower()
+    return format_extension(plan["output_format"])
 
 
 def execute_import(
@@ -570,14 +749,21 @@ def execute_import(
     cancel_check: Optional[Callable[[], bool]] = None,
     proc_callback: Optional[Callable[[subprocess.Popen], None]] = None,
 ) -> Tuple[bool, str, List[str]]:
-    """
-    Executes the album import:
-    - Variant 1: Copies files to organized destination, writes updated tags, upserts to DB.
-    - Variant 2: Runs QAAC conversion with -v 224 and resampling if > 48kHz, moves to destination, writes tags, upserts to DB.
-    Provides real-time progress callbacks and supports non-blocking cancellation.
+    """Imports an album into the library using the chosen quality settings.
+
+    The settings come from the import dialog (``edited_album["import_mode"]``,
+    ``["import_format"]``, ``["import_rate"]``) and are clamped to the choices
+    that are valid for this source. Image albums are always split per CUE track.
     """
     if not edited_tracks:
         return False, "No tracks to import.", []
+    if int(getattr(analysis, "channels", 2) or 2) != 2:
+        return (
+            False,
+            f"Only 2-channel (stereo) audio is supported; this album has "
+            f"{analysis.channels} channels.",
+            [],
+        )
 
     def report_progress(curr: int, total: int, message: str, detail: str = "", pct: Optional[int] = None):
         if not progress_callback:
@@ -585,14 +771,11 @@ def execute_import(
         if pct is None:
             pct = int(min(curr / max(total, 1) * 100, 100))
         try:
-            # 5-arg signature: (curr, total, message, detail, pct)
             progress_callback(curr, total, message, detail, pct)
         except TypeError:
             try:
-                # 4-arg signature: (curr, total, message, detail)
                 progress_callback(curr, total, message, detail)
             except TypeError:
-                # 3-arg legacy signature: (curr, total, message)
                 progress_callback(curr, total, message)
 
     lib_dir = Path(library_path).resolve()
@@ -606,61 +789,174 @@ def execute_import(
         disc_numbers.add(int(match.group(1)) if match else 1)
     is_multi_disc = len(disc_numbers) > 1 or max(disc_numbers, default=1) > 1
 
-    imported_paths: List[str] = []
     total_tracks = len(edited_tracks)
-
-    # Shared cover path from edited_album
     new_cover = edited_album.get("cover_cache_path")
     remove_cov = bool(edited_album.get("remove_cover", False))
 
-    # ------------------ Execute Variant 1 ------------------
-    if analysis.variant == 1:
-        for idx, track in enumerate(edited_tracks, start=1):
+    settings = normalize_settings(
+        analysis.source_kind,
+        bool(analysis.is_hires),
+        {
+            "mode": edited_album.get("import_mode") or analysis.mode,
+            "format": edited_album.get("import_format") or analysis.output_format,
+            "rate": edited_album.get("import_rate") or analysis.target_rate,
+        },
+    )
+    analysis.mode = settings["mode"]
+    analysis.output_format = settings["format"]
+    analysis.target_rate = settings["rate"]
+
+    try:
+        jobs = _build_import_jobs(analysis, edited_tracks, settings)
+    except ValueError as exc:
+        return False, str(exc), []
+
+    imported_paths: List[str] = []
+    ffmpeg_jobs = [job for job in jobs if job["use_ffmpeg"]]
+    plan0 = jobs[0]["plan"] if jobs else {}
+
+    # ------------------ FFmpeg phase (0 - 85%) ------------------
+    temp_dir: Optional[Path] = None
+    if ffmpeg_jobs:
+        ffmpeg_path = find_ffmpeg_executable()
+        if not ffmpeg_path or not ffmpeg_path.exists():
+            return (
+                False,
+                "FFmpeg was not found on your system. FFmpeg is required to split or convert audio "
+                "(FLAC / ALAC / AAC / MP3 and APE/WavPack decoding).",
+                [],
+            )
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="malka_import_"))
+        for job in ffmpeg_jobs:
+            job["out_file"] = temp_dir / f"{job['idx']:03d}{_planned_extension(job)}"
+
+        action_label = "Splitting" if plan0.get("copy_stream") and plan0.get("split") else "Converting"
+        report_progress(
+            0,
+            total_tracks,
+            f"{action_label} {total_tracks} track(s)...",
+            f"Processing {len(ffmpeg_jobs)} file(s) with up to {MAX_CONVERSION_WORKERS} threads...",
+            0,
+        )
+
+        active_procs = set()
+        procs_lock = threading.Lock()
+        completed_count = [0]
+        count_lock = threading.Lock()
+        abort_event = threading.Event()
+
+        def _kill_active():
+            with procs_lock:
+                for proc in list(active_procs):
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                    except Exception:
+                        pass
+                active_procs.clear()
+
+        def _run_ffmpeg_job(job: Dict[str, Any]) -> Tuple[bool, str]:
+            if abort_event.is_set() or (cancel_check and cancel_check()):
+                return False, "Import cancelled by user."
+
+            out_file = job["out_file"]
+            cmd = _ffmpeg_command(ffmpeg_path, job, out_file)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception as exc:
+                return False, f"Could not start FFmpeg: {exc}"
+
+            with procs_lock:
+                if abort_event.is_set():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return False, "Import cancelled by user."
+                active_procs.add(proc)
+            if proc_callback:
+                proc_callback(proc)
+
+            _, stderr_data = proc.communicate()
+            with procs_lock:
+                active_procs.discard(proc)
+
+            if abort_event.is_set() or (cancel_check and cancel_check()):
+                return False, "Import cancelled by user."
+            if proc.returncode != 0:
+                err_line = (stderr_data or "").strip().splitlines()
+                reason = err_line[-1] if err_line else "FFmpeg conversion failed"
+                return False, f"FFmpeg failed on {job['src'].name}: {reason}"
+            if not out_file.exists() or out_file.stat().st_size == 0:
+                return False, f"FFmpeg produced no audio for {job['src'].name}"
+            return True, ""
+
+        try:
+            with ThreadPoolExecutor(max_workers=MAX_CONVERSION_WORKERS) as executor:
+                futures = [executor.submit(_run_ffmpeg_job, job) for job in ffmpeg_jobs]
+                for future in as_completed(futures):
+                    if cancel_check and cancel_check():
+                        abort_event.set()
+                        _kill_active()
+                        return False, "Import cancelled by user.", []
+                    ok, err = future.result()
+                    if not ok:
+                        abort_event.set()
+                        _kill_active()
+                        return False, err, []
+                    with count_lock:
+                        completed_count[0] += 1
+                        done = completed_count[0]
+                    pct = int((done / max(len(ffmpeg_jobs), 1)) * 85)
+                    report_progress(
+                        done,
+                        total_tracks,
+                        f"Processed {done}/{len(ffmpeg_jobs)} file(s)",
+                        f"FFmpeg ({MAX_CONVERSION_WORKERS} threads)...",
+                        pct,
+                    )
+        except Exception as exc:
+            return False, f"Conversion error: {exc}", []
+
+    # ------------------ Finalize phase: move/copy, tag, index ------------------
+    try:
+        for pos, job in enumerate(jobs, start=1):
             if cancel_check and cancel_check():
                 return False, "Import cancelled by user.", imported_paths
 
-            title = track.get("title", f"Track {idx}")
-            base_pct = int((idx - 1) / max(total_tracks, 1) * 100)
+            track = job["track"]
+            title = track.get("title", f"Track {pos}")
+            start_pct = 85 if ffmpeg_jobs else 0
+            pct = int(start_pct + (pos / max(total_tracks, 1)) * (100 - start_pct))
             report_progress(
-                idx,
+                pos,
                 total_tracks,
-                f"Importing track {idx}/{total_tracks}: {title}",
-                "Copying file to library...",
-                base_pct,
+                f"Saving track {pos}/{total_tracks}: {title}",
+                "Moving to library and embedding tags...",
+                pct,
             )
 
-            src_file = Path(track.get("source_path", track.get("file_path", "")))
-            if not src_file.exists():
-                return False, f"Source file not found: {src_file}", imported_paths
-
-            # Destination directory structure
-            album_artist_folder = sanitize_filename(track.get("album_artist", "Unknown Artist"))
-            year_str = sanitize_filename(track.get("year", "Unknown Year"))
-            album_str = sanitize_filename(track.get("album", "Unknown Album"))
-            album_folder = f"{year_str} - {album_str}"
-
-            if is_multi_disc:
-                disc_num = str(track.get("disc_no", "1")).strip() or "1"
-                dest_dir = lib_dir / album_artist_folder / album_folder / f"CD {disc_num}"
-            else:
-                dest_dir = lib_dir / album_artist_folder / album_folder
-
+            dest_dir = _destination_dir(lib_dir, track, is_multi_disc)
             dest_dir.mkdir(parents=True, exist_ok=True)
 
-            # Format track filename
-            ext = src_file.suffix.lower()
-            fname = format_track_filename(track, naming_format) + ext
-            dest_file = dest_dir / fname
+            src_file: Path = job["src"]
+            dest_file = dest_dir / (format_track_filename(track, naming_format) + _planned_extension(job))
 
-            # Copy file
-            shutil.copy2(src_file, dest_file)
+            if job["use_ffmpeg"]:
+                shutil.move(str(job["out_file"]), str(dest_file))
+            elif src_file.resolve() != dest_file.resolve():
+                shutil.copy2(src_file, dest_file)
 
-            # Write tags and artwork
-            cover_arg = None
-            if not remove_cov:
-                if new_cover and Path(new_cover).exists():
-                    cover_arg = new_cover
-
+            cover_arg = new_cover if (not remove_cov and new_cover and Path(new_cover).exists()) else None
             write_tags(
                 str(dest_file),
                 title=track.get("title"),
@@ -677,751 +973,29 @@ def execute_import(
                 remove_cover=remove_cov,
             )
 
-            # Verify file exists on disk and read final tags
             if not dest_file.exists():
-                return False, f"Destination file missing after copy: {dest_file}", imported_paths
+                return False, f"File missing after processing: {dest_file}", imported_paths
 
             final_tags = read_tags(str(dest_file))
             if track.get("bad_encoding") is not None:
                 final_tags["bad_encoding"] = int(track.get("bad_encoding", 0))
+            # Files are placed at their canonical path by definition; verify anyway
+            # (the template or album tags may differ from the chosen layout).
+            final_tags["is_organized"] = 1 if is_track_organized(
+                final_tags, [str(lib_dir)], naming_format, is_multi_disc
+            ) else 0
             upsert_track(db_conn, final_tags)
             imported_paths.append(str(dest_file))
-
-            done_pct = int(idx / max(total_tracks, 1) * 100)
-            report_progress(
-                idx,
-                total_tracks,
-                f"Imported track {idx}/{total_tracks}: {title}",
-                f"Completed ({idx}/{total_tracks})",
-                done_pct,
-            )
-
-    # ------------------ Execute Variant 2 (Conversion: QAAC on Windows / FFmpeg on Linux) ------------------
-    elif analysis.variant == 2:
-        source_ext = Path(analysis.source_flac_path).suffix.lower() if analysis.source_flac_path else None
-        enc_type, enc_path = get_audio_encoder(source_ext)
-        ffmpeg_path = find_ffmpeg_executable()
-
-        if not enc_path or not enc_path.exists():
-            if sys.platform != "win32":
-                return False, "FFmpeg was not found on your system. FFmpeg is required to convert audio.", []
-            else:
-                return False, "Neither qaac64.exe nor ffmpeg was found in codecs/ or system PATH.", []
-
-        if enc_type == "qaac" and (not ffmpeg_path or not ffmpeg_path.exists()):
-            return False, "FFmpeg was not found on your system. FFmpeg is required to decode and slice audio tracks.", []
-
-        cue_path = Path(analysis.cue_file_path)
-        if not cue_path.exists():
-            return False, f"CUE file not found: {cue_path}", []
-
-        # Temporary folder for conversion
-        temp_out = Path(tempfile.mkdtemp(prefix=f"malka_{enc_type}_out_"))
-        try:
-            target_sr = compute_resampling_rate(analysis.sample_rate)
-
-            cue_album = parse_cue_file(cue_path)
-            cue_tracks = cue_album.tracks if cue_album else []
-
-            source_flac = Path(analysis.source_flac_path) if analysis.source_flac_path else None
-            if not source_flac or not source_flac.exists():
-                cue_parent = cue_path.parent
-                for t in edited_tracks:
-                    fn = t.get("file_name")
-                    if fn and (cue_parent / fn).exists():
-                        source_flac = cue_parent / fn
-                        break
-                if not source_flac or not source_flac.exists():
-                    for ext in (".flac", ".wv", ".ape"):
-                        matches = list(cue_parent.glob(f"*{ext}"))
-                        if matches:
-                            source_flac = matches[0]
-                            break
-
-            if not source_flac or not source_flac.exists():
-                return False, f"Source audio file (.flac, .wv, .ape) not found for CUE: {cue_path}", []
-
-            # Build jobs for multithreaded conversion
-            jobs = []
-            for idx, track in enumerate(edited_tracks):
-                t_num = idx + 1
-                t_title = track.get("title", f"Track {t_num}")
-
-                cue_t = cue_tracks[idx] if idx < len(cue_tracks) else None
-                if not cue_t and cue_tracks:
-                    t_idx = track.get("cue_track_index")
-                    if t_idx is not None and 1 <= t_idx <= len(cue_tracks):
-                        cue_t = cue_tracks[t_idx - 1]
-
-                start_str = (cue_t.index01 if cue_t and cue_t.index01 else track.get("index01")) or "00:00:00"
-                start_sec = cue_time_to_seconds(start_str)
-                duration = None
-                if idx + 1 < len(cue_tracks):
-                    next_cue_t = cue_tracks[idx + 1]
-                    next_start_str = next_cue_t.index00 or next_cue_t.index01
-                    if next_start_str:
-                        next_start = cue_time_to_seconds(next_start_str)
-                        if next_start > start_sec:
-                            duration = next_start - start_sec
-                elif idx + 1 < len(edited_tracks):
-                    next_t = edited_tracks[idx + 1]
-                    next_start_str = next_t.get("index00") or next_t.get("index01")
-                    if next_start_str:
-                        next_start = cue_time_to_seconds(next_start_str)
-                        if next_start > start_sec:
-                            duration = next_start - start_sec
-
-                out_file = temp_out / f"{t_num:02d}.m4a"
-                jobs.append({
-                    "idx": idx,
-                    "t_num": t_num,
-                    "t_title": t_title,
-                    "start_sec": start_sec,
-                    "duration": duration,
-                    "out_file": out_file,
-                    "source_file": source_flac,
-                })
-
-            report_progress(
-                0,
-                total_tracks,
-                f"Starting {enc_type.upper()} multithreaded conversion...",
-                f"Converting {total_tracks} tracks (up to {MAX_CONVERSION_WORKERS} simultaneously)...",
-                0,
-            )
-
-            active_procs = set()
-            procs_lock = threading.Lock()
-            completed_count = [0]
-            count_lock = threading.Lock()
-            abort_event = threading.Event()
-
-            def _kill_active():
-                with procs_lock:
-                    for p in list(active_procs):
-                        try:
-                            if p.poll() is None:
-                                p.kill()
-                        except Exception:
-                            pass
-                    active_procs.clear()
-
-            def _convert_v2_track(job):
-                if abort_event.is_set() or (cancel_check and cancel_check()):
-                    return False, "Import cancelled by user."
-
-                start_sec = job["start_sec"]
-                duration = job["duration"]
-                source_file = job["source_file"]
-                out_file = job["out_file"]
-                t_num = job["t_num"]
-                t_title = job["t_title"]
-
-                if enc_type == "qaac":
-                    # Decode slice via FFmpeg to WAV and pipe into QAAC (-v 224 kbps)
-                    ff_cmd = [
-                        str(ffmpeg_path),
-                        "-nostats", "-loglevel", "error",
-                        "-y",
-                        "-ss", f"{start_sec:.3f}",
-                        "-i", str(source_file),
-                    ]
-                    if duration is not None:
-                        ff_cmd.extend(["-t", f"{duration:.3f}"])
-                    ff_cmd.extend(["-vn", "-f", "wav", "pipe:1"])
-
-                    qaac_cmd = [
-                        str(enc_path),
-                        "-v", "224",
-                    ]
-                    if target_sr:
-                        qaac_cmd.extend(["-r", str(target_sr)])
-                    qaac_cmd.extend(["-o", str(out_file), "-"])
-
-                    try:
-                        ff_proc = subprocess.Popen(
-                            ff_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                        with procs_lock:
-                            if abort_event.is_set():
-                                try:
-                                    ff_proc.kill()
-                                except Exception:
-                                    pass
-                                return False, "Import cancelled by user."
-                            active_procs.add(ff_proc)
-                        if proc_callback:
-                            proc_callback(ff_proc)
-
-                        qaac_proc = subprocess.Popen(
-                            qaac_cmd,
-                            stdin=ff_proc.stdout,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                        with procs_lock:
-                            if abort_event.is_set():
-                                try:
-                                    ff_proc.kill()
-                                    qaac_proc.kill()
-                                except Exception:
-                                    pass
-                                return False, "Import cancelled by user."
-                            active_procs.add(qaac_proc)
-                        if proc_callback:
-                            proc_callback(qaac_proc)
-
-                        qaac_out, qaac_err = qaac_proc.communicate()
-                        ff_proc.wait()
-                        ff_err = ff_proc.stderr.read() if ff_proc.stderr else b""
-                        try:
-                            if ff_proc.stderr:
-                                ff_proc.stderr.close()
-                            if ff_proc.stdout:
-                                ff_proc.stdout.close()
-                        except Exception:
-                            pass
-
-                        with procs_lock:
-                            active_procs.discard(ff_proc)
-                            active_procs.discard(qaac_proc)
-
-                        if abort_event.is_set() or (cancel_check and cancel_check()):
-                            return False, "Import cancelled by user."
-
-                        if ff_proc.returncode != 0:
-                            err_line = ff_err.decode(errors="replace").strip().splitlines()[-1] if ff_err else "FFmpeg decoder failed"
-                            return False, f"FFmpeg decode failed on track {t_num}: {err_line}"
-
-                        if qaac_proc.returncode != 0:
-                            err_line = qaac_err.decode(errors="replace").strip().splitlines()[-1] if qaac_err else "QAAC encoder failed"
-                            return False, f"QAAC encode failed on track {t_num}: {err_line}"
-
-                    except Exception as e:
-                        return False, f"Track {t_num} conversion error: {e}"
-
-                else:
-                    # FFmpeg native encode
-                    ff_cmd = [
-                        str(enc_path), "-y",
-                        "-ss", f"{start_sec:.3f}",
-                        "-i", str(source_file),
-                    ]
-                    if duration is not None:
-                        ff_cmd.extend(["-t", f"{duration:.3f}"])
-                    ff_cmd.extend(["-vn", "-c:a", "aac", "-b:a", "224k"])
-                    if target_sr:
-                        ff_cmd.extend(["-ar", str(target_sr)])
-                    ff_cmd.append(str(out_file))
-
-                    try:
-                        ff_proc = subprocess.Popen(
-                            ff_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                        with procs_lock:
-                            if abort_event.is_set():
-                                try:
-                                    ff_proc.kill()
-                                except Exception:
-                                    pass
-                                return False, "Import cancelled by user."
-                            active_procs.add(ff_proc)
-                        if proc_callback:
-                            proc_callback(ff_proc)
-
-                        _, stderr_data = ff_proc.communicate()
-
-                        with procs_lock:
-                            active_procs.discard(ff_proc)
-
-                        if abort_event.is_set() or (cancel_check and cancel_check()):
-                            return False, "Import cancelled by user."
-
-                        if ff_proc.returncode != 0:
-                            err_line = stderr_data.strip().splitlines()[-1] if stderr_data else "FFmpeg conversion failed"
-                            return False, f"FFmpeg conversion failed on track {t_num}: {err_line}"
-
-                    except Exception as e:
-                        return False, f"Track {t_num} conversion error: {e}"
-
-                with count_lock:
-                    completed_count[0] += 1
-                    curr_c = completed_count[0]
-                pct = int((curr_c / max(total_tracks, 1)) * 85)
-                report_progress(
-                    curr_c,
-                    total_tracks,
-                    f"Converted track {curr_c}/{total_tracks}: {t_title}",
-                    f"{enc_type.upper()} encoding ({MAX_CONVERSION_WORKERS} threads)...",
-                    pct,
-                )
-                return True, ""
-
-            with ThreadPoolExecutor(max_workers=MAX_CONVERSION_WORKERS) as executor:
-                futures = [executor.submit(_convert_v2_track, job) for job in jobs]
-                for future in as_completed(futures):
-                    if cancel_check and cancel_check():
-                        abort_event.set()
-                        _kill_active()
-                        return False, "Import cancelled by user.", []
-                    ok, err = future.result()
-                    if not ok:
-                        abort_event.set()
-                        _kill_active()
-                        return False, err, []
-
-            # Gather converted m4a files
-            converted_files = sorted(list(temp_out.glob("*.m4a")))
-            if not converted_files:
-                return False, f"{enc_type.upper()} completed but no .m4a files were generated.", []
-
-            # Step 2: Organize and write tags (85% to 100%)
-            for idx, track in enumerate(edited_tracks):
-                if cancel_check and cancel_check():
-                    return False, "Import cancelled by user.", imported_paths
-
-                if idx >= len(converted_files):
-                    break
-
-                t_num = idx + 1
-                t_title = track.get("title", f"Track {t_num}")
-                pct = int(85 + (t_num / max(total_tracks, 1)) * 15)
-
-                report_progress(
-                    t_num,
-                    total_tracks,
-                    f"Organizing and tagging {t_num}/{total_tracks}: {t_title}",
-                    "Moving to library and embedding tags...",
-                    pct,
-                )
-
-                m4a_src = converted_files[idx]
-
-                # Destination directory
-                album_artist_folder = sanitize_filename(track.get("album_artist", "Unknown Artist"))
-                year_str = sanitize_filename(track.get("year", "Unknown Year"))
-                album_str = sanitize_filename(track.get("album", "Unknown Album"))
-                album_folder = f"{year_str} - {album_str}"
-
-                if is_multi_disc:
-                    disc_num = str(track.get("disc_no", "1")).strip() or "1"
-                    dest_dir = lib_dir / album_artist_folder / album_folder / f"CD {disc_num}"
-                else:
-                    dest_dir = lib_dir / album_artist_folder / album_folder
-
-                dest_dir.mkdir(parents=True, exist_ok=True)
-
-                # Format filename with .m4a extension
-                fname = format_track_filename(track, naming_format) + ".m4a"
-                dest_file = dest_dir / fname
-
-                # Move converted file to final library path
-                shutil.move(str(m4a_src), str(dest_file))
-
-                # Apply final user tags and artwork
-                cover_arg = None
-                if not remove_cov:
-                    if new_cover and Path(new_cover).exists():
-                        cover_arg = new_cover
-
-                write_tags(
-                    str(dest_file),
-                    title=track.get("title"),
-                    artist=track.get("artist"),
-                    album_artist=track.get("album_artist"),
-                    album=track.get("album"),
-                    year=track.get("year"),
-                    genre=track.get("genre"),
-                    track_no=track.get("track_no"),
-                    disc_no=track.get("disc_no", "1"),
-                    disc_total=track.get("disc_total", "1"),
-                    compilation=int(track.get("compilation", 0)),
-                    new_cover_path=cover_arg,
-                    remove_cover=remove_cov,
-                )
-
-                # Verify file exists on disk
-                if not dest_file.exists():
-                    return False, f"File missing after conversion and move: {dest_file}", imported_paths
-
-                final_tags = read_tags(str(dest_file))
-                if track.get("bad_encoding") is not None:
-                    final_tags["bad_encoding"] = int(track.get("bad_encoding", 0))
-                upsert_track(db_conn, final_tags)
-                imported_paths.append(str(dest_file))
-
-        finally:
-            shutil.rmtree(temp_out, ignore_errors=True)
-
-    # ------------------ Execute Variant 3 (Track-by-track Lossless Conversion) ------------------
-    elif analysis.variant == 3:
-        any_wv_ape = any(
-            Path(t.get("source_path", t.get("file_path", ""))).suffix.lower() in (".wv", ".ape")
-            for t in edited_tracks
-        )
-        source_ext = ".wv" if any_wv_ape else ".flac"
-        enc_type, enc_path = get_audio_encoder(source_ext)
-        ffmpeg_path = find_ffmpeg_executable()
-
-        if not enc_path or not enc_path.exists():
-            if sys.platform != "win32":
-                return False, "FFmpeg was not found on your system. Please install or bundle FFmpeg to convert audio.", []
-            else:
-                return False, "Neither qaac64.exe nor ffmpeg was found in project or system PATH.", []
-
-        if enc_type == "qaac" and any_wv_ape and (not ffmpeg_path or not ffmpeg_path.exists()):
-            return False, "FFmpeg was not found on your system. FFmpeg is required to decode .wv/.ape audio.", []
-
-        # Identify all tracks that need conversion (.flac, .wv, .ape)
-        flac_entries = []
-        for idx, track in enumerate(edited_tracks):
-            src_file = Path(track.get("source_path", track.get("file_path", "")))
-            if src_file.suffix.lower() in LOSSLESS_IMAGE_EXTS:
-                flac_entries.append((idx, track, src_file))
-
-        temp_out = Path(tempfile.mkdtemp(prefix=f"malka_{enc_type}_tracks_"))
-        try:
-            target_sr = compute_resampling_rate(analysis.sample_rate)
-
-            report_progress(
-                0,
-                total_tracks,
-                f"Starting {enc_type.upper()} multithreaded conversion...",
-                f"Converting {len(flac_entries)} lossless tracks (up to {MAX_CONVERSION_WORKERS} simultaneously)...",
-                0,
-            )
-
-            active_procs = set()
-            procs_lock = threading.Lock()
-            completed_count = [0]
-            count_lock = threading.Lock()
-            abort_event = threading.Event()
-
-            def _kill_active_v3():
-                with procs_lock:
-                    for p in list(active_procs):
-                        try:
-                            if p.poll() is None:
-                                p.kill()
-                        except Exception:
-                            pass
-                    active_procs.clear()
-
-            def _convert_v3_track(entry):
-                if abort_event.is_set() or (cancel_check and cancel_check()):
-                    return False, "Import cancelled by user."
-
-                orig_idx, track, src_file = entry
-                out_name = f"{src_file.stem}.m4a"
-                out_file = temp_out / out_name
-                t_num = orig_idx + 1
-                t_title = track.get("title", src_file.stem)
-                ext = src_file.suffix.lower()
-
-                if enc_type == "qaac":
-                    if ext in (".wv", ".ape"):
-                        # Decode via FFmpeg to WAV and pipe into QAAC (-v 224 kbps)
-                        ff_cmd = [
-                            str(ffmpeg_path),
-                            "-nostats", "-loglevel", "error",
-                            "-y",
-                            "-i", str(src_file),
-                            "-vn", "-f", "wav", "pipe:1",
-                        ]
-                        qaac_cmd = [
-                            str(enc_path),
-                            "-v", "224",
-                        ]
-                        if target_sr:
-                            qaac_cmd.extend(["-r", str(target_sr)])
-                        qaac_cmd.extend(["-o", str(out_file), "-"])
-
-                        try:
-                            ff_proc = subprocess.Popen(
-                                ff_cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            )
-                            with procs_lock:
-                                if abort_event.is_set():
-                                    try:
-                                        ff_proc.kill()
-                                    except Exception:
-                                        pass
-                                    return False, "Import cancelled by user."
-                                active_procs.add(ff_proc)
-                            if proc_callback:
-                                proc_callback(ff_proc)
-
-                            qaac_proc = subprocess.Popen(
-                                qaac_cmd,
-                                stdin=ff_proc.stdout,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            )
-                            with procs_lock:
-                                if abort_event.is_set():
-                                    try:
-                                        ff_proc.kill()
-                                        qaac_proc.kill()
-                                    except Exception:
-                                        pass
-                                    return False, "Import cancelled by user."
-                                active_procs.add(qaac_proc)
-                            if proc_callback:
-                                proc_callback(qaac_proc)
-
-                            qaac_out, qaac_err = qaac_proc.communicate()
-                            ff_proc.wait()
-                            ff_err = ff_proc.stderr.read() if ff_proc.stderr else b""
-                            try:
-                                if ff_proc.stderr:
-                                    ff_proc.stderr.close()
-                                if ff_proc.stdout:
-                                    ff_proc.stdout.close()
-                            except Exception:
-                                pass
-
-                            with procs_lock:
-                                active_procs.discard(ff_proc)
-                                active_procs.discard(qaac_proc)
-
-                            if abort_event.is_set() or (cancel_check and cancel_check()):
-                                return False, "Import cancelled by user."
-
-                            if ff_proc.returncode != 0:
-                                err_line = ff_err.decode(errors="replace").strip().splitlines()[-1] if ff_err else "FFmpeg decoder failed"
-                                return False, f"FFmpeg decode failed on {src_file.name}: {err_line}"
-
-                            if qaac_proc.returncode != 0:
-                                err_line = qaac_err.decode(errors="replace").strip().splitlines()[-1] if qaac_err else "QAAC encoder failed"
-                                return False, f"QAAC encode failed on {src_file.name}: {err_line}"
-
-                        except Exception as e:
-                            return False, f"Track {src_file.name} conversion error: {e}"
-
-                    else:
-                        # FLAC decoded natively by QAAC
-                        qaac_cmd = [
-                            str(enc_path),
-                            "-v", "224",
-                        ]
-                        if target_sr:
-                            qaac_cmd.extend(["-r", str(target_sr)])
-                        qaac_cmd.extend(["-o", str(out_file), str(src_file)])
-
-                        try:
-                            proc = subprocess.Popen(
-                                qaac_cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                encoding="utf-8",
-                                errors="replace",
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            )
-                            with procs_lock:
-                                if abort_event.is_set():
-                                    try:
-                                        proc.kill()
-                                    except Exception:
-                                        pass
-                                    return False, "Import cancelled by user."
-                                active_procs.add(proc)
-                            if proc_callback:
-                                proc_callback(proc)
-
-                            _, stderr_data = proc.communicate()
-
-                            with procs_lock:
-                                active_procs.discard(proc)
-
-                            if abort_event.is_set() or (cancel_check and cancel_check()):
-                                return False, "Import cancelled by user."
-
-                            if proc.returncode != 0:
-                                err_line = stderr_data.strip().splitlines()[-1] if stderr_data else "QAAC conversion failed"
-                                return False, f"QAAC conversion failed on {src_file.name}: {err_line}"
-
-                        except Exception as e:
-                            return False, f"Track {src_file.name} conversion error: {e}"
-
-                else:
-                    # FFmpeg native encode
-                    ff_cmd = [
-                        str(enc_path), "-y",
-                        "-i", str(src_file),
-                        "-vn", "-c:a", "aac", "-b:a", "224k",
-                    ]
-                    if target_sr:
-                        ff_cmd.extend(["-ar", str(target_sr)])
-                    ff_cmd.append(str(out_file))
-
-                    try:
-                        ff_proc = subprocess.Popen(
-                            ff_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                        with procs_lock:
-                            if abort_event.is_set():
-                                try:
-                                    ff_proc.kill()
-                                except Exception:
-                                    pass
-                                return False, "Import cancelled by user."
-                            active_procs.add(ff_proc)
-                        if proc_callback:
-                            proc_callback(ff_proc)
-
-                        _, stderr_data = ff_proc.communicate()
-
-                        with procs_lock:
-                            active_procs.discard(ff_proc)
-
-                        if abort_event.is_set() or (cancel_check and cancel_check()):
-                            return False, "Import cancelled by user."
-
-                        if ff_proc.returncode != 0:
-                            err_line = stderr_data.strip().splitlines()[-1] if stderr_data else "FFmpeg conversion failed"
-                            return False, f"FFmpeg conversion failed on {src_file.name}: {err_line}"
-
-                    except Exception as e:
-                        return False, f"Track {src_file.name} conversion error: {e}"
-
-                with count_lock:
-                    completed_count[0] += 1
-                    curr_c = completed_count[0]
-                pct = int((curr_c / max(len(flac_entries), 1)) * 85)
-                report_progress(
-                    curr_c,
-                    total_tracks,
-                    f"Converted track {curr_c}/{len(flac_entries)}: {t_title}",
-                    f"{enc_type.upper()} encoding ({MAX_CONVERSION_WORKERS} threads)...",
-                    pct,
-                )
-                return True, ""
-
-            with ThreadPoolExecutor(max_workers=MAX_CONVERSION_WORKERS) as executor:
-                futures = [executor.submit(_convert_v3_track, entry) for entry in flac_entries]
-                for future in as_completed(futures):
-                    if cancel_check and cancel_check():
-                        abort_event.set()
-                        _kill_active_v3()
-                        return False, "Import cancelled by user.", []
-                    ok, err = future.result()
-                    if not ok:
-                        abort_event.set()
-                        _kill_active_v3()
-                        return False, err, []
-
-            # Step 2: Organize and write tags (85% to 100%)
-            for idx, track in enumerate(edited_tracks):
-                if cancel_check and cancel_check():
-                    return False, "Import cancelled by user.", imported_paths
-
-                t_num = idx + 1
-                t_title = track.get("title", f"Track {t_num}")
-                pct = int(85 + (t_num / max(total_tracks, 1)) * 15)
-
-                report_progress(
-                    t_num,
-                    total_tracks,
-                    f"Organizing and tagging {t_num}/{total_tracks}: {t_title}",
-                    "Moving to library and embedding tags...",
-                    pct,
-                )
-
-                src_file = Path(track.get("source_path", track.get("file_path", "")))
-
-                # Destination directory
-                album_artist_folder = sanitize_filename(track.get("album_artist", "Unknown Artist"))
-                year_str = sanitize_filename(track.get("year", "Unknown Year"))
-                album_str = sanitize_filename(track.get("album", "Unknown Album"))
-                album_folder = f"{year_str} - {album_str}"
-
-                if is_multi_disc:
-                    disc_num = str(track.get("disc_no", "1")).strip() or "1"
-                    dest_dir = lib_dir / album_artist_folder / album_folder / f"CD {disc_num}"
-                else:
-                    dest_dir = lib_dir / album_artist_folder / album_folder
-
-                dest_dir.mkdir(parents=True, exist_ok=True)
-
-                if src_file.suffix.lower() in LOSSLESS_IMAGE_EXTS:
-                    # Converted file in temp_out
-                    m4a_src = temp_out / (src_file.stem + ".m4a")
-                    if not m4a_src.exists():
-                        candidates = sorted(list(temp_out.glob("*.m4a")))
-                        for cand in candidates:
-                            if cand.stem.lower() == src_file.stem.lower():
-                                m4a_src = cand
-                                break
-                        else:
-                            if idx < len(candidates):
-                                m4a_src = candidates[idx]
-
-                    fname = format_track_filename(track, naming_format) + ".m4a"
-                    dest_file = dest_dir / fname
-                    shutil.move(str(m4a_src), str(dest_file))
-                else:
-                    ext = src_file.suffix.lower()
-                    fname = format_track_filename(track, naming_format) + ext
-                    dest_file = dest_dir / fname
-                    shutil.copy2(src_file, dest_file)
-
-                # Apply final user tags and artwork
-                cover_arg = None
-                if not remove_cov:
-                    if new_cover and Path(new_cover).exists():
-                        cover_arg = new_cover
-
-                write_tags(
-                    str(dest_file),
-                    title=track.get("title"),
-                    artist=track.get("artist"),
-                    album_artist=track.get("album_artist"),
-                    album=track.get("album"),
-                    year=track.get("year"),
-                    genre=track.get("genre"),
-                    track_no=track.get("track_no"),
-                    disc_no=track.get("disc_no", "1"),
-                    disc_total=track.get("disc_total", "1"),
-                    compilation=int(track.get("compilation", 0)),
-                    new_cover_path=cover_arg,
-                    remove_cover=remove_cov,
-                )
-
-                if not dest_file.exists():
-                    return False, f"File missing after processing: {dest_file}", imported_paths
-
-                final_tags = read_tags(str(dest_file))
-                if track.get("bad_encoding") is not None:
-                    final_tags["bad_encoding"] = int(track.get("bad_encoding", 0))
-                upsert_track(db_conn, final_tags)
-                imported_paths.append(str(dest_file))
-
-        finally:
-            shutil.rmtree(temp_out, ignore_errors=True)
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Clear staging table
     clear_import_tracks(db_conn)
     db_conn.commit()
 
-    return True, f"Successfully imported {len(imported_paths)} tracks into library.", imported_paths
+    if ffmpeg_jobs:
+        action = "converted" if not plan0.get("copy_stream") else "split"
+    else:
+        action = "copied unchanged"
+    return True, f"Successfully imported {len(imported_paths)} tracks ({action}).", imported_paths

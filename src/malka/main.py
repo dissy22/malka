@@ -3,6 +3,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication
 
+from malka.ui.image_utils import emoji_icon
 from malka.ui.main_window import MainWindow
 
 
@@ -11,6 +12,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Malka")
     app.setOrganizationName("MalkaMusic")
+    app.setWindowIcon(emoji_icon("🎵"))
 
     # Set default modern font
     font = QFont("Segoe UI", 9)

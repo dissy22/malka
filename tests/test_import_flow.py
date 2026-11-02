@@ -8,11 +8,11 @@ from pathlib import Path
 
 from malka.config import NO_DATA
 from malka.db import get_all_albums, get_album_tracks, get_connection, get_import_tracks, init_db
+from malka.formats import MODE_COPY, MODE_LOSSLESS_RESAMPLE, MODE_LOSSY
 from malka.importer import (
     analyze_import_folder,
-    compute_resampling_rate,
     execute_import,
-    find_qaac_executable,
+    find_ffmpeg_executable,
 )
 from malka.tags import read_tags, write_tags
 
@@ -30,28 +30,10 @@ class TestImportFlow(unittest.TestCase):
         self.conn.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_resampling_rules(self):
-        # 44.1 kHz and 48 kHz: no resampling
-        self.assertIsNone(compute_resampling_rate(44100))
-        self.assertIsNone(compute_resampling_rate(48000))
-        self.assertIsNone(compute_resampling_rate(22050))
-        self.assertIsNone(compute_resampling_rate(32000))
-
-        # > 48 kHz divisible by 44100 -> 44100
-        self.assertEqual(compute_resampling_rate(88200), 44100)
-        self.assertEqual(compute_resampling_rate(176400), 44100)
-
-        # > 48 kHz divisible by 48000 -> 48000
-        self.assertEqual(compute_resampling_rate(96000), 48000)
-        self.assertEqual(compute_resampling_rate(192000), 48000)
-
-        # Other rates above 48 kHz
-        self.assertEqual(compute_resampling_rate(88240), 44100)
-
-    def test_qaac_executable_found(self):
-        qaac = find_qaac_executable()
-        self.assertIsNotNone(qaac)
-        self.assertTrue(qaac.exists())
+    def test_ffmpeg_encoder_found(self):
+        ffmpeg_path = find_ffmpeg_executable()
+        self.assertIsNotNone(ffmpeg_path)
+        self.assertTrue(Path(ffmpeg_path).exists())
 
     def test_variant_1_analysis_and_import(self):
         # Test Variant 1 with Wishmaster if present
@@ -166,58 +148,45 @@ class TestImportFlow(unittest.TestCase):
         self.assertTrue((dest_folder / "01. Inner Urge.m4a").exists())
         self.assertTrue((dest_folder / "05. Night and Day.m4a").exists())
 
-    def test_variant_2_single_flac_cue_conversion(self):
-        # Create a single FLAC + CUE image folder
+    def _make_flac_image_album(self) -> Path:
+        """Builds a small real FLAC image + CUE album using the bundled FFmpeg."""
+        import imageio_ffmpeg
+        import subprocess
+
         album_src = self.temp_dir / "Source_Cue_Album"
         album_src.mkdir()
-
-        # Generate a small 3-second stereo WAV
-        wav_path = album_src / "temp.wav"
-        with wave.open(str(wav_path), "w") as w:
-            w.setnchannels(2)
-            w.setsampwidth(2)
-            w.setframerate(44100)
-            for i in range(44100 * 3):
-                w.writeframes(struct.pack("<hh", 1000, 1000))
-
-        # Convert WAV to FLAC using refalac / flac or write minimal FLAC
         flac_path = album_src / "album.flac"
-
-        # Use foobar flac.exe or qaac decode/convert
-        flac_tool = Path(r"C:\Program Files\foobar2000\encoders\flac.exe")
-        if flac_tool.exists():
-            import subprocess
-            subprocess.run([str(flac_tool), "-s", str(wav_path), "-o", str(flac_path)], check=True)
-            wav_path.unlink()
-        else:
-            self.skipTest("flac.exe encoder not found for Variant 2 synthetic test")
-
-        # Create CUE sheet defining 2 tracks
+        subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=330:duration=3",
+                "-ac", "2", "-ar", "96000", "-sample_fmt", "s32", "-c:a", "flac",
+                str(flac_path),
+            ],
+            check=True,
+        )
         cue_path = album_src / "album.cue"
-        cue_text = f"""
-TITLE "Ambient Journey"
-PERFORMER "Sound Explorer"
-REM DATE 2023
-REM GENRE "Ambient"
-FILE "{flac_path.name}" WAVE
-  TRACK 01 AUDIO
-    TITLE "First Dawn"
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    TITLE "Second Light"
-    INDEX 01 00:01:50
-"""
-        with open(cue_path, "w", encoding="utf-8") as f:
-            f.write(cue_text)
+        cue_path.write_text(
+            'TITLE "Ambient Journey"\n'
+            'PERFORMER "Sound Explorer"\n'
+            "REM DATE 2023\n"
+            'REM GENRE "Ambient"\n'
+            f'FILE "{flac_path.name}" WAVE\n'
+            '  TRACK 01 AUDIO\n    TITLE "First Dawn"\n    INDEX 01 00:00:00\n'
+            '  TRACK 02 AUDIO\n    TITLE "Second Light"\n    INDEX 01 00:01:50\n',
+            encoding="utf-8",
+        )
+        return album_src
 
-        # Analyze folder
+    def _import_cue_album(self, mode=MODE_COPY, fmt="flac", rate=48000):
+        album_src = self._make_flac_image_album()
         analysis = analyze_import_folder(str(album_src), self.conn)
         self.assertEqual(analysis.variant, 2)
         self.assertEqual(analysis.album, "Ambient Journey")
         self.assertEqual(analysis.album_artist, "Sound Explorer")
         self.assertEqual(len(analysis.tracks), 2)
+        self.assertEqual(analysis.sample_rate, 96000)
 
-        # Execute Import (QAAC conversion to M4A)
         edited_album = {
             "album": "Ambient Journey",
             "album_artist": "Sound Explorer",
@@ -227,6 +196,10 @@ FILE "{flac_path.name}" WAVE
             "cover_cache_path": "",
             "remove_cover": False,
         }
+        edited_album["import_mode"] = mode
+        edited_album["import_format"] = fmt
+        edited_album["import_rate"] = rate
+
         success, msg, imported = execute_import(
             analysis=analysis,
             edited_album=edited_album,
@@ -235,21 +208,35 @@ FILE "{flac_path.name}" WAVE
             naming_format="<track_no>. <title>",
             db_conn=self.conn,
         )
-
-        self.assertTrue(success)
+        self.assertTrue(success, msg)
         self.assertEqual(len(imported), 2)
+        return analysis, imported
 
-        # Check that converted tracks exist with .m4a extension
+    def test_variant_2_image_split_to_m4a(self):
+        self._import_cue_album(MODE_LOSSY, fmt="m4a", rate=48000)
         dest_folder = self.lib_dir / "Sound Explorer" / "2023 - Ambient Journey"
-        self.assertTrue(dest_folder.exists())
         self.assertTrue((dest_folder / "01. First Dawn.m4a").exists())
         self.assertTrue((dest_folder / "02. Second Light.m4a").exists())
 
-        # Check DB reflects the new album and tracks
         alb_tracks = get_album_tracks(self.conn, "Ambient Journey", "Sound Explorer")
         self.assertEqual(len(alb_tracks), 2)
         self.assertEqual(alb_tracks[0]["title"], "First Dawn")
         self.assertEqual(alb_tracks[1]["title"], "Second Light")
+
+    def test_variant_2_image_split_to_flac_with_resampling(self):
+        self._import_cue_album(MODE_LOSSLESS_RESAMPLE, fmt="flac", rate=48000)
+        dest_folder = self.lib_dir / "Sound Explorer" / "2023 - Ambient Journey"
+        first = dest_folder / "01. First Dawn.flac"
+        second = dest_folder / "02. Second Light.flac"
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+
+        # 96 kHz source must be reduced to 48 kHz / 16-bit.
+        from malka.tags import get_audio_stream_info
+        info = get_audio_stream_info(str(first))
+        self.assertEqual(info["sample_rate"], 48000)
+        self.assertEqual(info["bits_per_sample"], 16)
+        self.assertGreaterEqual(first.stat().st_size, 1000)
 
     def test_variant_2_real_louis_armstrong_import(self):
         candidates = [
@@ -339,12 +326,7 @@ FILE "{flac_path.name}" WAVE
         self.assertEqual(len(analysis.tracks), 11)
         self.assertTrue(bool(analysis.cover_cache_path))
 
-        # Check encoder selection uses QAAC on Windows with FFmpeg decoder available
-        from malka.importer import get_audio_encoder, find_ffmpeg_executable
-        enc_type, enc_path = get_audio_encoder(".ape")
-        self.assertEqual(enc_type, "qaac")
-        self.assertIsNotNone(enc_path)
-        self.assertTrue(enc_path.exists())
+        # FFmpeg is the only encoder backend.
         ffmpeg_path = find_ffmpeg_executable()
         self.assertIsNotNone(ffmpeg_path)
         self.assertTrue(ffmpeg_path.exists())
@@ -367,12 +349,7 @@ FILE "{flac_path.name}" WAVE
         self.assertEqual(len(analysis.tracks), 10)
         self.assertTrue(bool(analysis.cover_cache_path))
 
-        # Check encoder selection uses QAAC on Windows with FFmpeg decoder available
-        from malka.importer import get_audio_encoder, find_ffmpeg_executable
-        enc_type, enc_path = get_audio_encoder(".wv")
-        self.assertEqual(enc_type, "qaac")
-        self.assertIsNotNone(enc_path)
-        self.assertTrue(enc_path.exists())
+        # FFmpeg is the only encoder backend.
         ffmpeg_path = find_ffmpeg_executable()
         self.assertIsNotNone(ffmpeg_path)
         self.assertTrue(ffmpeg_path.exists())

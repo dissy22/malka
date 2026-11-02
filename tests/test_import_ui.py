@@ -104,7 +104,7 @@ class TestImportUI(unittest.TestCase):
 
         dlg.reject()
 
-    def test_import_dialog_variant_2_banner(self):
+    def test_import_dialog_hi_res_image_settings_and_summary(self):
         analysis = ImportAnalysisResult(
             variant=2,
             album="CUE Journey",
@@ -113,13 +113,82 @@ class TestImportUI(unittest.TestCase):
             genre="Electronic",
             sample_rate=96000,
             bits_per_sample=24,
-            target_sample_rate=48000,
-            tracks=[],
+            source_flac_path="album.flac",
+            tracks=[
+                {"title": "One", "artist": "Explorer", "album_artist": "Explorer",
+                 "album": "CUE Journey", "year": "2020", "genre": "Electronic",
+                 "track_no": "01", "disc_no": "1", "disc_total": "1", "index01": "00:00:00"},
+            ],
         )
         dlg = ImportDialog(analysis)
-        labels = dlg.banner.findChildren(QLabel)
-        self.assertGreaterEqual(len(labels), 2)
-        self.assertIn("Variant 2", labels[1].text())
+        dlg.show()
+
+        # Hi-Res image: lossy / lossless-resample / keep Hi-Res, all with splitting.
+        modes = [dlg.mode_combo.itemData(i) for i in range(dlg.mode_combo.count())]
+        self.assertEqual(modes, ["lossy", "lossless_resample", "copy"])
+        self.assertIn("Split into 1 track", dlg.summary_body_lbl.text())
+
+        # Lossy mode exposes MP3/M4A plus the resampling ceiling.
+        dlg.mode_combo.setCurrentIndex(modes.index("lossy"))
+        self.assertEqual(
+            [dlg.format_combo.itemData(i) for i in range(dlg.format_combo.count())],
+            ["mp3", "m4a"],
+        )
+        self.assertTrue(dlg.rate_combo.isVisible())
+        self.assertTrue(dlg.rate_combo.itemData(0) == 44100)
+
+        # Lossless resample exposes FLAC/ALAC.
+        dlg.mode_combo.setCurrentIndex(modes.index("lossless_resample"))
+        self.assertEqual(
+            [dlg.format_combo.itemData(i) for i in range(dlg.format_combo.count())],
+            ["flac", "alac"],
+        )
+
+        # Keep original: format is fixed to the source and the rate picker is hidden.
+        dlg.mode_combo.setCurrentIndex(modes.index("copy"))
+        self.assertFalse(dlg.format_combo.isEnabled())
+        self.assertIn("FLAC", dlg.format_combo.currentText())
+        self.assertFalse(dlg.rate_combo.isVisible())
+
+        # Summary always shows album, artist, year and the destination path.
+        summary = dlg.summary_body_lbl.text()
+        title = dlg.summary_title_lbl.text()
+        self.assertIn("CUE Journey", title)
+        self.assertIn("Explorer", title)
+        self.assertIn("2020", title)
+        self.assertIn("Destination:", summary)
+        self.assertIn("Explorer", summary)
+
+        # Destination selector exists and follows the configured library roots.
+        self.assertIsNotNone(dlg.destination_combo)
+        self.assertEqual(dlg.destination_combo.count(), max(1, len(config.library_paths)))
+
+        dlg.reject()
+
+    def test_import_dialog_mp3_tracks_have_no_conversion_choice(self):
+        analysis = ImportAnalysisResult(
+            variant=1,
+            album="Lossy Album",
+            album_artist="Lossy Artist",
+            year="2022",
+            genre="Pop",
+            sample_rate=44100,
+            bits_per_sample=16,
+            tracks=[
+                {"title": "One", "artist": "Lossy Artist", "album_artist": "Lossy Artist",
+                 "album": "Lossy Album", "year": "2022", "genre": "Pop",
+                 "track_no": "01", "disc_no": "1", "disc_total": "1"},
+            ],
+        )
+        dlg = ImportDialog(analysis)
+        dlg.show()
+        self.assertEqual(
+            [dlg.mode_combo.itemData(i) for i in range(dlg.mode_combo.count())],
+            ["copy"],
+        )
+        self.assertFalse(dlg.format_combo.isEnabled())
+        self.assertIn("no re-encoding", dlg.mode_combo.currentText())
+        self.assertFalse(dlg.rate_combo.isVisible())
         dlg.reject()
 
     def test_main_window_drag_drop_accepts_folder(self):

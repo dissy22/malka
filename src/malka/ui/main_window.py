@@ -1,8 +1,9 @@
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
-from PyQt6.QtGui import QAction, QActionGroup, QFont, QIcon
+from PyQt6.QtCore import QEvent, QPoint, QSize, Qt, QTimer
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -41,11 +42,20 @@ from malka.db import (
     sort_artists,
     sort_genres,
 )
+from malka.formats import IMPORT_SOURCE_EXTS
 from malka.importer import analyze_import_folder, execute_import
-from malka.organizer import is_album_ready_to_organize, organize_album
+from malka.organizer import (
+    apply_organization_plan,
+    find_containing_root,
+    is_album_ready_to_organize,
+    is_track_organized,
+    refresh_organization_flags,
+)
 from malka.player import PlayerController
 from malka.scanner import LibraryScanner
+from malka.ui.about_dialog import AboutDialog
 from malka.ui.album_card import AlbumCard
+from malka.ui.audio_info import request_audio_info
 from malka.ui.album_detail_view import AlbumDetailView
 from malka.ui.artist_card import ArtistCard
 from malka.ui.breadcrumb_bar import BreadcrumbBar
@@ -53,13 +63,48 @@ from malka.ui.edit_dialog import EditAlbumDialog
 from malka.ui.file_utils import open_folder, reveal_file
 from malka.ui.flow_layout import FlowLayout
 from malka.ui.genre_card import GenreCard
+from malka.ui.image_utils import emoji_icon, get_tinted_icon
 from malka.ui.import_dialog import ImportDialog
 from malka.ui.import_progress_dialog import ImportProgressDialog
 from malka.ui.player_sidebar import PlayerSidebar
 from malka.ui.section_header import SectionHeaderWidget
+from malka.ui.organize_dialog import OrganizeDialog
 from malka.ui.settings_dialog import SettingsDialog
 from malka.ui.statistics_view import StatisticsView
 from malka.ui.title_bar import CustomTitleBar
+
+#: Everything the import workflow accepts when dropped on the window.
+IMPORT_DROP_EXTS = IMPORT_SOURCE_EXTS | {".cue", ".m3u", ".m3u8"}
+
+
+def album_page_marker(album: Dict[str, Any], sort_mode: str) -> str:
+    """Short label describing where a page starts/ends under the current sort.
+
+    * title sorting  -> first letter of the album title;
+    * year sorting   -> the year (e.g. ``1970``);
+    * artist/year    -> first three letters of the artist name.
+    """
+    if sort_mode in ("title_asc", "title_desc"):
+        name = str(album.get("album", "")).strip()
+        if not name:
+            return "#"
+        ch = name[0].upper()
+        return ch if ch.isalnum() else "#"
+
+    if sort_mode in ("year_asc", "year_desc"):
+        year = str(album.get("year", "") or "").strip()
+        match = re.search(r"\b(19|20)\d{2}\b", year)
+        return match.group(0) if match else "#"
+
+    # Default: artist/year sorting.
+    artist = str(album.get("display_artist") or album.get("album_artist") or "").strip()
+    if not artist:
+        return "#"
+    return artist[:3].upper()
+
+
+def format_page_label(first: str, last: str) -> str:
+    return first if first == last else f"{first}-{last}"
 
 
 class NavRowWidget(QWidget):
@@ -132,10 +177,53 @@ class NavRowWidget(QWidget):
             self.sort_button.setGeometry(sb_x, sb_y, sb_w, sb_h)
 
 
+class _TopFade(QWidget):
+    """Content fades into the window background as it scrolls under the header."""
+
+    def __init__(self, parent=None, height: int = 44):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self._color = QColor("#0e1116")
+        self._strength = 0.0
+        self.setFixedHeight(height)
+
+    def set_theme(self, theme: str):
+        self._color = QColor("#f6f8fa" if theme == "light" else "#0e1116")
+        self.update()
+
+    def set_strength(self, strength: float):
+        """0 = fully transparent (content at the top), 1 = solid at the top edge."""
+        strength = max(0.0, min(1.0, float(strength)))
+        if abs(strength - self._strength) < 0.01:
+            return
+        self._strength = strength
+        self.update()
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QLinearGradient
+
+        painter = QPainter(self)
+        if self._strength <= 0.0:
+            return
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        top = QColor(self._color)
+        top.setAlpha(int(255 * self._strength))
+        bottom = QColor(self._color)
+        bottom.setAlpha(0)
+        gradient.setColorAt(0.0, top)
+        gradient.setColorAt(0.55, top)
+        gradient.setColorAt(1.0, bottom)
+        painter.fillRect(self.rect(), gradient)
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, check_first_launch: bool = True):
         super().__init__()
         self.setWindowTitle("Malka — Music Library Organizer")
+        self.setWindowIcon(emoji_icon("🎵"))
         self.resize(1050, 750)
         self.setMinimumSize(800, 550)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
@@ -181,6 +269,10 @@ class MainWindow(QMainWindow):
         # Audio player controller
         self.player_controller = PlayerController(self)
         self.player_controller.error_occurred.connect(self._on_player_error)
+        self.player_controller.track_started.connect(self._on_track_started_quality)
+        self._track_info_path: str = ""
+        self._track_info = None
+        self._track_bitrates = None
         self.player_controller.playback_stopped.connect(self._on_playback_stopped)
 
         # Search debounce timer (150ms)
@@ -188,6 +280,13 @@ class MainWindow(QMainWindow):
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(150)
         self.search_timer.timeout.connect(self.refresh_current_view)
+
+        # Refreshes the bottom bar once a second so the "now playing" quality
+        # and bitrate stay current.
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self._update_status_bar_info)
+        self._status_timer.start()
 
         self.init_ui()
         self.apply_theme(self.theme)
@@ -224,33 +323,40 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(10)
 
-        self.btn_select_dir = QPushButton("📁 Add Library Folder")
-        self.btn_select_dir.setProperty("class", "topBtn")
+        def _toolbar_button(tooltip: str) -> QPushButton:
+            button = QPushButton("")
+            button.setProperty("class", "topBtn")
+            button.setToolTip(tooltip)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFixedSize(36, 30)
+            button.setIconSize(QSize(20, 20))
+            return button
+
+        self.btn_select_dir = _toolbar_button("Add Library Folder")
         self.btn_select_dir.clicked.connect(self._on_select_directory)
         top_bar.addWidget(self.btn_select_dir)
 
-        self.btn_import = QPushButton("📥 Import Album")
-        self.btn_import.setProperty("class", "topBtn")
+        self.btn_import = _toolbar_button("Import Album")
         self.btn_import.clicked.connect(self._on_click_import)
         top_bar.addWidget(self.btn_import)
 
-        self.btn_rescan = QPushButton("🔄 Rescan Library")
-        self.btn_rescan.setProperty("class", "topBtn")
+        self.btn_rescan = _toolbar_button("Rescan Library")
         self.btn_rescan.clicked.connect(lambda: self.start_scanning(force=True))
         top_bar.addWidget(self.btn_rescan)
 
-        self.btn_settings = QPushButton("⚙️ Settings")
-        self.btn_settings.setProperty("class", "topBtn")
+        self.btn_settings = _toolbar_button("Settings")
         self.btn_settings.clicked.connect(self._on_open_settings)
         top_bar.addWidget(self.btn_settings)
 
-        self.btn_stats = QPushButton("📊 Statistics")
+        self.btn_stats = _toolbar_button("Statistics")
         self.btn_stats.setObjectName("btnStats")
-        self.btn_stats.setProperty("class", "topBtn")
         self.btn_stats.setCheckable(True)
-        self.btn_stats.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stats.toggled.connect(self._on_toggle_statistics)
         top_bar.addWidget(self.btn_stats)
+
+        self.btn_about = _toolbar_button("About Malka")
+        self.btn_about.clicked.connect(self._on_show_about)
+        top_bar.addWidget(self.btn_about)
 
         top_bar.addStretch()
 
@@ -363,6 +469,9 @@ class MainWindow(QMainWindow):
         # Page 1: Album Detail View
         self.album_detail_view = AlbumDetailView(self.player_controller, self.db_conn)
         self.album_detail_view.track_play_requested.connect(self._on_track_play_requested)
+        self.album_detail_view.artist_clicked.connect(self._go_to_artist)
+        self.album_detail_view.genre_clicked.connect(self._go_to_genre)
+        self.album_detail_view.year_clicked.connect(self._search_year)
         self.album_detail_view.track_location_requested.connect(self._on_track_location_requested)
         self.main_stack.addWidget(self.album_detail_view)
 
@@ -372,6 +481,32 @@ class MainWindow(QMainWindow):
         self.statistics_view.album_selected.connect(self._on_stat_album_selected)
         self.statistics_view.genre_selected.connect(self._on_stat_genre_selected)
         self.main_stack.addWidget(self.statistics_view)
+
+        # Albums/artists/genres/album page scroll under a fade instead of being
+        # clipped by a hard edge below the navigation.
+        self._scroll_fades = {}
+        for viewport in (
+            self._albums_scroll_area.viewport(),
+            self._artists_scroll_area.viewport(),
+            self._genres_scroll_area.viewport(),
+            self.album_detail_view.scroll_area.viewport(),
+        ):
+            fade = _TopFade(viewport)
+            fade.setGeometry(0, 0, viewport.width(), fade.height())
+            fade.raise_()
+            fade.show()
+            self._scroll_fades[viewport] = fade
+            viewport.installEventFilter(self)
+
+        def _bind_scroll(scroll_area, fade):
+            bar = scroll_area.verticalScrollBar()
+            bar.valueChanged.connect(lambda value, f=fade: self._update_top_fade(f, value))
+            self._update_top_fade(fade, bar.value())
+
+        _bind_scroll(self._albums_scroll_area, self._scroll_fades[self._albums_scroll_area.viewport()])
+        _bind_scroll(self._artists_scroll_area, self._scroll_fades[self._artists_scroll_area.viewport()])
+        _bind_scroll(self._genres_scroll_area, self._scroll_fades[self._genres_scroll_area.viewport()])
+        _bind_scroll(self.album_detail_view.scroll_area, self._scroll_fades[self.album_detail_view.scroll_area.viewport()])
 
         body_layout.addWidget(self.main_stack, 1)
 
@@ -432,6 +567,14 @@ class MainWindow(QMainWindow):
             msg.exec()
             self._on_select_directory()
         else:
+            try:
+                refresh_organization_flags(
+                    self.db_conn,
+                    list(config.library_paths),
+                    config.track_naming_format,
+                )
+            except Exception:
+                pass
             self.refresh_library_view()
             if not self.all_albums_cache:
                 self.start_scanning(force=False)
@@ -536,6 +679,10 @@ class MainWindow(QMainWindow):
                 self.status_info_label.setText(f"Added library folder: {directory}")
             self.start_scanning(force=True)
 
+    def _on_show_about(self):
+        dlg = AboutDialog(self, theme=self.theme)
+        dlg.exec()
+
     def _on_open_settings(self):
         dlg = SettingsDialog(self)
         dlg.settings_saved.connect(self._on_settings_saved)
@@ -571,7 +718,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.scan_status_label.setText("Preparing to scan...")
 
-        self.scanner_thread = LibraryScanner(config.library_paths, config.db_path, force_rescan=force)
+        self.scanner_thread = LibraryScanner(
+            config.library_paths,
+            config.db_path,
+            force_rescan=force,
+            naming_format=config.track_naming_format,
+        )
         self.scanner_thread.progress.connect(self._on_scan_progress)
         self.scanner_thread.status_text.connect(self._on_scan_status_text)
         self.scanner_thread.finished_scan.connect(self._on_scan_finished)
@@ -788,6 +940,27 @@ class MainWindow(QMainWindow):
             self.btn_sort.show()
         self._update_view_buttons_style()
         self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self._update_breadcrumb()
+        self.refresh_current_view()
+
+    def _search_year(self, year: str):
+        """Shows all albums of a given year by filling the search box."""
+        year = (year or "").strip()
+        if not year:
+            return
+        if getattr(self, "is_stats_mode", False):
+            self.btn_stats.setChecked(False)
+        self.current_view = "albums"
+        self.prev_view = "albums"
+        self.album_page = 0
+        self.artist_filter = None
+        self.genre_filter = None
+        self.main_stack.setCurrentIndex(0)
+        self._set_catalog_page("albums")
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.show()
+        self._update_view_buttons_style()
+        self.search_edit.setText(year)
         self._update_breadcrumb()
         self.refresh_current_view()
 
@@ -1058,12 +1231,61 @@ class MainWindow(QMainWindow):
             return paths[0]
         return f"{paths[0]} (+{len(paths) - 1} more)"
 
+    def _on_track_started_quality(self, track, album_data):
+        """Load stream info + per-second bitrate profile for the new track."""
+        file_path = (track or {}).get("file_path", "")
+        self._track_info_path = file_path
+        self._track_info = None
+        self._track_bitrates = None
+        if not file_path:
+            return
+
+        def _ready(path, info, profile):
+            if path != self._track_info_path:
+                return
+            self._track_info = info
+            self._track_bitrates = profile
+            self._update_status_bar_info()
+
+        request_audio_info(file_path, _ready)
+
+    def _current_track_bitrate(self) -> int:
+        from malka.bitrate import bitrate_at
+
+        info = self._track_info or {}
+        return bitrate_at(
+            self._track_bitrates,
+            int(info.get("bitrate") or 0),
+            int(self.player_controller.position_ms()),
+        )
+
+    def _now_playing_text(self) -> str:
+        """Sample rate / bit depth / bitrate of the second being played."""
+        track = getattr(self.player_controller, "current_track", None)
+        info = self._track_info
+        if not track or not info:
+            return ""
+
+        parts = []
+        sample_rate = int(info.get("sample_rate") or 0)
+        bit_depth = int(info.get("bits_per_sample") or 0)
+        channels = int(info.get("channels") or 0)
+        if sample_rate:
+            parts.append(f"{sample_rate / 1000:g} kHz")
+        if bit_depth:
+            parts.append(f"{bit_depth}-bit")
+        if channels:
+            parts.append(f"{channels} ch")
+        bitrate = self._current_track_bitrate()
+        if bitrate:
+            parts.append(f"≈{bitrate} kbps")
+        return f"  |  ♪ {' · '.join(parts)}" if parts else ""
+
     def _update_status_bar_info(self):
         total_albums = len(self.all_albums_cache)
         total_tracks = sum(a.get("track_count", 0) for a in self.all_albums_cache)
-        folders_label = "Folders" if len(getattr(config, "library_paths", [])) > 1 else "Folder"
         self.status_info_label.setText(
-            f"{folders_label}: {self._library_display_text()}  |  Albums: {total_albums}  |  Tracks: {total_tracks}"
+            f"Albums: {total_albums}  |  Tracks: {total_tracks}" + self._now_playing_text()
         )
 
     def _on_search_text_edited(self, text: str):
@@ -1456,13 +1678,8 @@ class MainWindow(QMainWindow):
         items.extend(("album", alb) for alb in filtered)
         return items
 
-    @staticmethod
-    def _album_initial(album: Dict[str, Any]) -> str:
-        name = str(album.get("album", "")).strip()
-        if not name:
-            return "#"
-        ch = name[0].upper()
-        return ch if ch.isalnum() else "#"
+    def _page_marker(self, album: Dict[str, Any]) -> str:
+        return album_page_marker(album, self.album_sort_mode)
 
     def _update_album_pager(self, page_count: int, items: List[tuple]):
         layout = self._albums_pager_layout
@@ -1495,10 +1712,10 @@ class MainWindow(QMainWindow):
             chunk = items[page * self.album_page_size:(page + 1) * self.album_page_size]
             albums = [item[1] for item in chunk if item[0] == "album"]
             if albums:
-                first = self._album_initial(albums[0])
-                last = self._album_initial(albums[-1])
+                first = self._page_marker(albums[0])
+                last = self._page_marker(albums[-1])
                 page_chunks.append((page, first, last, albums))
-        labels = [first if first == last else f"{first}-{last}" for _, first, last, _ in page_chunks]
+        labels = [format_page_label(first, last) for _, first, last, _ in page_chunks]
         duplicate_labels = len(set(labels)) < len(labels)
 
         layout.addStretch(1)
@@ -1810,8 +2027,17 @@ class MainWindow(QMainWindow):
     def _update_container_height(self):
         self._resize_catalog_page(self.scroll_area)
 
+    @staticmethod
+    def _update_top_fade(fade, scroll_value: int):
+        # Ramp in over the first 40 px of scrolling so the resting grid stays clean.
+        fade.set_strength(min(1.0, max(0, int(scroll_value)) / 40.0))
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Resize:
+            fade = getattr(self, "_scroll_fades", {}).get(obj)
+            if fade is not None:
+                fade.setGeometry(0, 0, obj.width(), fade.height())
+                fade.raise_()
             for sa in (
                 getattr(self, "_albums_scroll_area", None),
                 getattr(self, "_artists_scroll_area", None),
@@ -1847,9 +2073,26 @@ class MainWindow(QMainWindow):
         if hasattr(self, "flow_layout") and hasattr(self, "scroll_area") and hasattr(self, "container_widget"):
             self._update_container_height()
 
+    def _apply_toolbar_icons(self, theme: str):
+        icons = {
+            self.btn_select_dir: ("add_library_path.png", 20),
+            self.btn_import: ("import_album.png", 20),
+            self.btn_rescan: ("rescan_library.webp", 20),
+            self.btn_settings: ("settings.png", 20),
+            self.btn_stats: ("statistics.png", 20),
+            self.btn_about: ("about.png", 20),
+        }
+        for button, (filename, size) in icons.items():
+            button.setIcon(get_tinted_icon(filename, size=size, theme=theme))
+            button.setIconSize(QSize(size, size))
+
     def apply_theme(self, theme: str):
         self.theme = theme
         config.theme = theme
+        if hasattr(self, "btn_stats"):
+            self._apply_toolbar_icons(theme)
+        for fade in getattr(self, "_scroll_fades", {}).values():
+            fade.set_theme(theme)
         if theme == "light":
             self.setStyleSheet("""
                 QMainWindow {
@@ -2337,6 +2580,9 @@ class MainWindow(QMainWindow):
             updated["album"] = album
             updated["genre"] = genre
             updated["bad_encoding"] = 0
+            updated["is_organized"] = 1 if is_track_organized(
+                updated, list(config.library_paths), config.track_naming_format
+            ) else 0
             upsert_track(self.db_conn, updated)
             fixed_count += 1
 
@@ -2344,60 +2590,67 @@ class MainWindow(QMainWindow):
 
     def _on_organize_album(self, album_name: str, album_artist: str):
         tracks = get_album_tracks(self.db_conn, album_name, album_artist)
+        if not tracks:
+            return
         ready, reason = is_album_ready_to_organize(tracks)
         if not ready:
             QMessageBox.warning(self, "Organization Unavailable", reason)
             return
 
-        confirm = QMessageBox.question(
-            self,
-            "Confirm Organization",
-            f"Organize album '{album_name}'?\n\n"
-            f"Files will be moved to:\n"
-            f"<Library>/{tracks[0]['album_artist']}/{tracks[0]['year']} - {tracks[0]['album']}/\n\n"
-            f"And renamed according to template: {config.track_naming_format}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-
-        if confirm == QMessageBox.StandardButton.Yes:
-            album_root = None
-            if tracks:
-                album_root = config.library_root_for_path(tracks[0].get("file_path", ""))
-            album_root = album_root or config.library_path
-            if not album_root or not Path(album_root).exists():
-                QMessageBox.warning(
-                    self,
-                    "Organization Unavailable",
-                    "The library folder that contains this album is not available.",
-                )
-                return
-
-            token = self.player_controller.suspend_for_file_operation(
-                [t.get("file_path", "") for t in tracks]
+        roots = [p for p in config.library_paths if Path(p).exists()]
+        if not roots:
+            QMessageBox.warning(
+                self,
+                "Organization Unavailable",
+                "The library folder that contains this album is not available.",
             )
-            updated = tracks
-            try:
-                success, msg, updated = organize_album(
-                    album_root,
-                    tracks,
-                    config.track_naming_format,
-                    self.db_conn,
-                )
-            finally:
-                if token:
-                    path_map = {}
-                    for old, new in zip(tracks, updated):
-                        old_path = old.get("file_path", "")
-                        new_path = new.get("file_path", "")
-                        if old_path and new_path:
-                            path_map[old_path] = new_path
-                    self.player_controller.resume_after_file_operation(token, path_map=path_map)
+            return
 
-            if success:
-                self.refresh_library_view()
-                QMessageBox.information(self, "Success", msg)
-            else:
-                QMessageBox.critical(self, "Organization Error", msg)
+        default_root = find_containing_root(tracks[0].get("file_path", ""), roots) or roots[0]
+        dlg = OrganizeDialog(
+            tracks,
+            roots,
+            default_root,
+            config.track_naming_format,
+            parent=self,
+            theme=self.theme,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        library_root = dlg.chosen_library()
+        plan = dlg.plan()
+        if not plan:
+            return
+
+        token = self.player_controller.suspend_for_file_operation(
+            [t.get("file_path", "") for t in tracks]
+        )
+        updated = tracks
+        try:
+            success, msg, updated = apply_organization_plan(
+                plan,
+                library_root,
+                self.db_conn,
+                config.track_naming_format,
+            )
+        finally:
+            if token:
+                path_map = {}
+                for old, new_track in zip(tracks, updated):
+                    old_path = old.get("file_path", "")
+                    new_path = new_track.get("file_path", "")
+                    if old_path and new_path:
+                        path_map[old_path] = new_path
+                self.player_controller.resume_after_file_operation(token, path_map=path_map)
+
+        if success:
+            self.refresh_library_view()
+            self._update_status_bar_info()
+            self.status_info_label.setText(f"✔ Organized album '{album_name}'")
+            QMessageBox.information(self, "Success", msg)
+        else:
+            QMessageBox.critical(self, "Organization Error", msg)
 
     def _on_open_album_folder(self, album_name: str, album_artist: str):
         tracks = get_album_tracks(self.db_conn, album_name, album_artist)
@@ -2424,7 +2677,7 @@ class MainWindow(QMainWindow):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 p = Path(url.toLocalFile())
-                if p.is_dir() or p.suffix.lower() in (".cue", ".flac", ".mp3", ".m4a", ".aac", ".m3u", ".wv", ".ape"):
+                if p.is_dir() or p.suffix.lower() in IMPORT_DROP_EXTS:
                     event.acceptProposedAction()
                     self.status_info_label.setText("Drop album folder here to import...")
                     return
@@ -2496,6 +2749,22 @@ class MainWindow(QMainWindow):
         dlg = ImportDialog(analysis, self, theme=self.theme)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             edited_album, edited_tracks = dlg.get_result_data()
+
+            # Remember the chosen quality settings for this kind of import and
+            # use them for the actual conversion run.
+            import_settings = {
+                "mode": edited_album.get("import_mode") or analysis.mode,
+                "format": edited_album.get("import_format") or analysis.output_format,
+                "rate": edited_album.get("import_rate") or analysis.target_rate,
+            }
+            analysis.mode = import_settings["mode"]
+            analysis.output_format = import_settings["format"]
+            analysis.target_rate = int(import_settings["rate"])
+            try:
+                config.set_import_settings(analysis.source_kind, import_settings)
+                config.save()
+            except Exception:
+                pass
 
             destination = existing_roots[0]
             if hasattr(dlg, "get_destination_library"):

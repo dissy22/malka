@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from malka.formats import SOURCE_KINDS
+
 DEFAULT_NAMING_FORMAT = "<track_no>. <title>"
 
 
@@ -52,11 +54,15 @@ class Config:
         self.audio_device_id: str = ""
         self.theme: str = "dark"
         self.show_scrollbars: bool = True
+        self.show_organize_badge: bool = True
+        self.show_encoding_badge: bool = True
         self.album_sort_mode: str = "artist_year"
         self.artist_sort_mode: str = "name_asc"
         self.genre_sort_mode: str = "name_asc"
         self.volume: int = 100
         self.playback_state: Optional[Dict[str, Any]] = None
+        # Remembered import quality settings per source kind (see malka.formats).
+        self.import_settings: Dict[str, Dict[str, Any]] = {}
         self.load()
 
     # ------------------------------------------------------------------
@@ -153,6 +159,24 @@ class Config:
                 best_len = len(str(resolved))
         return best
 
+    # ------------------------------------------------------------------
+    # Import settings
+    # ------------------------------------------------------------------
+    def get_import_settings(self, source_kind: str) -> Dict[str, Any]:
+        """Returns the remembered quality settings for a kind of import."""
+        stored = self.import_settings.get(source_kind)
+        return dict(stored) if isinstance(stored, dict) else {}
+
+    def set_import_settings(self, source_kind: str, settings: Dict[str, Any]) -> None:
+        """Remembers mode/format/rate for a kind of import."""
+        if source_kind not in SOURCE_KINDS or not isinstance(settings, dict):
+            return
+        self.import_settings[source_kind] = {
+            "mode": str(settings.get("mode") or ""),
+            "format": str(settings.get("format") or "flac"),
+            "rate": int(settings.get("rate") or 48000),
+        }
+
     def load(self) -> None:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -177,6 +201,8 @@ class Config:
                     self.audio_device_id = data.get("audio_device_id", "")
                     self.theme = data.get("theme", "dark")
                     self.show_scrollbars = data.get("show_scrollbars", True)
+                    self.show_organize_badge = bool(data.get("show_organize_badge", True))
+                    self.show_encoding_badge = bool(data.get("show_encoding_badge", True))
                     self.album_sort_mode = data.get("album_sort_mode", "artist_year")
                     self.artist_sort_mode = data.get("artist_sort_mode", "name_asc")
                     self.genre_sort_mode = data.get("genre_sort_mode", "name_asc")
@@ -186,6 +212,16 @@ class Config:
                         self.volume = 100
                     saved_state = data.get("playback_state")
                     self.playback_state = saved_state if isinstance(saved_state, dict) else None
+                    saved_imports = data.get("import_settings")
+                    if isinstance(saved_imports, dict):
+                        for kind in SOURCE_KINDS:
+                            value = saved_imports.get(kind)
+                            if isinstance(value, dict):
+                                self.import_settings[kind] = {
+                                    "mode": str(value.get("mode") or ""),
+                                    "format": str(value.get("format") or "flac"),
+                                    "rate": int(value.get("rate") or 48000),
+                                }
             except Exception:
                 pass
 
@@ -236,11 +272,14 @@ class Config:
             "audio_device_id": self.audio_device_id,
             "theme": self.theme,
             "show_scrollbars": self.show_scrollbars,
+            "show_organize_badge": self.show_organize_badge,
+            "show_encoding_badge": self.show_encoding_badge,
             "album_sort_mode": self.album_sort_mode,
             "artist_sort_mode": self.artist_sort_mode,
             "genre_sort_mode": self.genre_sort_mode,
             "volume": self.volume,
             "playback_state": self.playback_state,
+            "import_settings": {k: dict(v) for k, v in self.import_settings.items()},
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

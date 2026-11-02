@@ -7,6 +7,7 @@ Displays a dedicated album page with:
 - Interactive tracklist with hover highlight and Play icon
 - Plays tracks via PlayerController
 """
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
 from malka.config import NO_DATA, config
 from malka.db import get_album_tracks
 from malka.player import PlayerController, format_time_ms, is_file_playable
+from malka.ui.audio_info import request_audio_info
 from malka.ui.image_utils import (
     create_square_placeholder,
     get_cached_square_pixmap,
@@ -79,6 +81,21 @@ def _get_initial_duration_str(track: Dict[str, Any]) -> str:
         pass
     fp = track.get("file_path", "")
     return _TRACK_DURATION_CACHE.get(fp, "")
+
+
+class ClickableLabel(QLabel):
+    """A QLabel that behaves like a link (hand cursor + clicked signal)."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class TrackRowWidget(QFrame):
@@ -300,6 +317,9 @@ class AlbumDetailView(QWidget):
     back_requested = pyqtSignal()
     track_play_requested = pyqtSignal(dict, dict, list)  # (track, album_data, all_tracks)
     track_location_requested = pyqtSignal(dict)  # reveal the track file in the file manager
+    artist_clicked = pyqtSignal(str)
+    genre_clicked = pyqtSignal(str)
+    year_clicked = pyqtSignal(str)
 
     def __init__(self, controller: PlayerController, db_conn, parent=None):
         super().__init__(parent)
@@ -388,18 +408,30 @@ class AlbumDetailView(QWidget):
         meta_container.setSpacing(4)
         meta_container.setContentsMargins(0, 0, 0, 0)
 
-        # Artist
-        self.artist_label = QLabel("Artist Name")
+        # Artist (clickable -> artist page)
+        self.artist_label = ClickableLabel("Artist Name")
         self.artist_label.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
         self.artist_label.setStyleSheet("color: #58a6ff;")
         self.artist_label.setWordWrap(True)
+        self.artist_label.setToolTip("Show all albums by this artist")
+        self.artist_label.clicked.connect(
+            lambda: self.artist_clicked.emit(self.artist_label.text())
+        )
         meta_container.addWidget(self.artist_label)
 
-        # Secondary Metadata (Year • Genre • Track count • Discs)
-        self.meta_label = QLabel("2020 • Rock • 12 tracks")
+        # Secondary Metadata (Year • Genre • Track count • Discs).
+        # Year and genre are links: one opens a year search, the other a genre.
+        self.meta_label = QLabel("")
         self.meta_label.setFont(QFont("Segoe UI", 9))
         self.meta_label.setStyleSheet("color: #8b949e;")
         self.meta_label.setWordWrap(True)
+        self.meta_label.setTextFormat(Qt.TextFormat.RichText)
+        self.meta_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.meta_label.setOpenExternalLinks(False)
+        self.meta_label.linkActivated.connect(self._on_meta_link)
+        self._meta_year = ""
+        self._meta_genre = ""
+        self._meta_tracks = ""
         meta_container.addWidget(self.meta_label)
 
         left_layout.addLayout(meta_container)
@@ -435,12 +467,35 @@ class AlbumDetailView(QWidget):
         self.btn_play_album.clicked.connect(self._on_play_album_clicked)
         left_layout.addWidget(self.btn_play_album)
 
+        # Audio quality of the album (sample rate / bit depth / format)
+        quality_row = QHBoxLayout()
+        quality_row.setContentsMargins(0, 0, 0, 0)
+        quality_row.setSpacing(8)
+
+        self.hires_logo = QLabel()
+        self.hires_logo.setObjectName("hiresLogo")
+        self.hires_logo.setFixedSize(15, 15)
+        self.hires_logo.setToolTip("Hi-Res audio: above 48 kHz and/or above 16-bit")
+        self.hires_logo.hide()
+        quality_row.addWidget(self.hires_logo, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.quality_label = QLabel("")
+        self.quality_label.setObjectName("albumQuality")
+        self.quality_label.setFont(QFont("Segoe UI", 8))
+        self.quality_label.setStyleSheet("color: #8b949e;")
+        self.quality_label.setWordWrap(True)
+        quality_row.addWidget(self.quality_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        quality_row.addStretch(1)
+
+        left_layout.addLayout(quality_row)
+
         # Album comment tag (shown right below "Play album")
         self.comment_label = QLabel("")
         self.comment_label.setObjectName("albumComment")
         self.comment_label.setFont(QFont("Segoe UI", 8))
         self.comment_label.setWordWrap(True)
-        self.comment_label.setStyleSheet("color: #8b949e;")
+        self.comment_label.setTextFormat(Qt.TextFormat.RichText)
+        self.comment_label.setStyleSheet("color: #6e7681;")
         self.comment_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.comment_label.hide()
         left_layout.addWidget(self.comment_label)
@@ -502,8 +557,12 @@ class AlbumDetailView(QWidget):
         disc_count = album_data.get("disc_count", 1)
         disc_str = f" • {disc_count} CDs" if disc_count > 1 else ""
 
-        meta_parts = [p for p in (year_str, genre_str, tr_str) if p]
-        self.meta_label.setText(" • ".join(meta_parts) + disc_str)
+        self._meta_year = year_str
+        self._meta_genre = genre_str
+        self._meta_tracks = tr_str + disc_str
+        self._update_meta_label()
+
+        self._update_quality_info()
 
         # Comment tag (use the first non-empty track comment of the album)
         comment = ""
@@ -525,7 +584,7 @@ class AlbumDetailView(QWidget):
             except Exception:
                 pass
         if comment:
-            self.comment_label.setText(comment)
+            self.comment_label.setText(f"Commentary:<br>{escape(comment)}")
             self.comment_label.setToolTip(comment)
             self.comment_label.show()
         else:
@@ -548,6 +607,73 @@ class AlbumDetailView(QWidget):
 
         # Render track rows
         self._render_tracks()
+
+    def _on_meta_link(self, link: str):
+        if link.startswith("year:"):
+            self.year_clicked.emit(link[5:])
+        elif link.startswith("genre:"):
+            self.genre_clicked.emit(link[6:])
+
+    def _update_meta_label(self):
+        color = "#656d76" if self.theme == "light" else "#8b949e"
+        parts = []
+        if self._meta_year:
+            parts.append(
+                f'<a href="year:{escape(self._meta_year)}" style="color:{color}; text-decoration:none;">'
+                f"{escape(self._meta_year)}</a>"
+            )
+        if self._meta_genre:
+            parts.append(
+                f'<a href="genre:{escape(self._meta_genre)}" style="color:{color}; text-decoration:none;">'
+                f"{escape(self._meta_genre)}</a>"
+            )
+        if self._meta_tracks:
+            parts.append(escape(self._meta_tracks))
+        self.meta_label.setText(" • ".join(parts))
+
+    def _update_quality_info(self):
+        """Reads stream info of the album's files on demand (nothing in the DB)."""
+        self.quality_label.setText("")
+        self.quality_label.hide()
+        self.hires_logo.hide()
+        if not self.tracks:
+            return
+        file_path = self.tracks[0].get("file_path", "")
+        if not file_path:
+            return
+        request_audio_info(file_path, self._on_quality_info)
+
+    def _on_quality_info(self, path: str, info: dict, profile):
+        # Ignore stale responses after switching to another album.
+        if not self.tracks or self.tracks[0].get("file_path") != path:
+            return
+        sample_rate = int(info.get("sample_rate") or 0)
+        bit_depth = int(info.get("bits_per_sample") or 0)
+
+        parts = []
+        if sample_rate:
+            parts.append(f"{sample_rate / 1000:g} kHz")
+        # Bit depth only exists for lossless codecs (FLAC/ALAC); AAC and MP3 have none.
+        if bit_depth:
+            parts.append(f"{bit_depth}-bit")
+        codec = info.get("codec") or {".flac": "FLAC", ".m4a": "M4A", ".mp3": "MP3"}.get(
+            Path(path).suffix.lower(), ""
+        )
+        if codec:
+            parts.append(str(codec))
+
+        self.quality_label.setText(" · ".join(parts))
+        self.quality_label.setVisible(bool(parts))
+
+        is_hires = sample_rate > 48000 or bit_depth > 16
+        if is_hires and parts:
+            if self.hires_logo.pixmap().isNull():
+                pixmap = get_resource_pixmap("Hi-Res_Audio_(logo).svg.webp", width=15, height=15)
+                self.hires_logo.setPixmap(pixmap)
+            self.hires_logo.show()
+            self.hires_logo.setToolTip(f"Hi-Res audio: {sample_rate / 1000:g} kHz / {bit_depth}-bit")
+        else:
+            self.hires_logo.hide()
 
     def _on_cover_loaded(self, path: str, pixmap: QPixmap):
         curr_cover = self.album_data.get("cover_path", "")
@@ -620,10 +746,12 @@ class AlbumDetailView(QWidget):
                 self.title_label.setStyleSheet("color: #1f2328;")
             if hasattr(self, "artist_label"):
                 self.artist_label.setStyleSheet("color: #0969da;")
+            if hasattr(self, "quality_label"):
+                self.quality_label.setStyleSheet("color: #656d76;")
             if hasattr(self, "meta_label"):
                 self.meta_label.setStyleSheet("color: #656d76;")
             if hasattr(self, "comment_label"):
-                self.comment_label.setStyleSheet("color: #656d76; font-size: 8pt;")
+                self.comment_label.setStyleSheet("color: #8b949e; font-size: 8pt;")
             if hasattr(self, "btn_play_album"):
                 self.btn_play_album.setStyleSheet("""
                     QPushButton {
@@ -653,10 +781,14 @@ class AlbumDetailView(QWidget):
                 self.title_label.setStyleSheet("color: #ffffff;")
             if hasattr(self, "artist_label"):
                 self.artist_label.setStyleSheet("color: #58a6ff;")
+            if hasattr(self, "quality_label"):
+                self.quality_label.setStyleSheet("color: #8b949e;")
             if hasattr(self, "meta_label"):
                 self.meta_label.setStyleSheet("color: #8b949e;")
             if hasattr(self, "comment_label"):
-                self.comment_label.setStyleSheet("color: #8b949e; font-size: 8pt;")
+                self.comment_label.setStyleSheet("color: #6e7681; font-size: 8pt;")
+            if hasattr(self, "meta_label"):
+                self._update_meta_label()
             if hasattr(self, "btn_play_album"):
                 self.btn_play_album.setStyleSheet("""
                     QPushButton {
@@ -702,6 +834,12 @@ class AlbumDetailView(QWidget):
         self.track_play_requested.emit(self.tracks[0] if self.tracks else {}, self.album_data, self.tracks)
 
     def _on_track_clicked(self, track: Dict[str, Any]):
+        current = self.controller.current_track
+        same_track = bool(current) and current.get("file_path") == track.get("file_path")
+        if same_track:
+            # Second click on the playing track pauses / resumes it.
+            self.controller.toggle_play_pause()
+            return
         self.track_play_requested.emit(track, self.album_data, self.tracks)
 
     def _on_track_started(self, track: Dict[str, Any], album_data: Dict[str, Any]):

@@ -183,6 +183,10 @@ def read_tags(file_path: str) -> Dict[str, Any]:
         "cover_cache_path": "",
         "mtime": 0.0,
         "duration": 0.0,
+        "sample_rate": 0,
+        "bits_per_sample": 0,
+        "channels": 0,
+        "bitrate": 0,
         "bad_encoding": 0,
     }
 
@@ -217,6 +221,15 @@ def read_tags(file_path: str) -> Dict[str, Any]:
 
     result["bad_encoding"] = 1 if has_bad else 0
 
+    # Average bitrate of the stored file (kbps), not the decoded PCM rate.
+    try:
+        size = path.stat().st_size
+        duration = float(result.get("duration") or 0)
+        if size > 0 and duration > 0:
+            result["bitrate"] = int(round(size * 8 / duration / 1000))
+    except Exception:
+        pass
+
     # Compilation handling
     if result["compilation"] == 1:
         if result["album_artist"] == NO_DATA or not result["album_artist"]:
@@ -237,6 +250,9 @@ def _read_mp3_tags(file_path: str, result: Dict[str, Any]) -> None:
 
     if hasattr(audio, "info") and hasattr(audio.info, "length"):
         result["duration"] = float(audio.info.length)
+        result["sample_rate"] = int(getattr(audio.info, "sample_rate", 0) or 0)
+        result["channels"] = int(getattr(audio.info, "channels", 0) or 0)
+        result["bits_per_sample"] = 0  # MP3 is lossy: no meaningful bit depth
 
     if not audio.tags:
         return
@@ -321,6 +337,13 @@ def _read_mp4_tags(file_path: str, result: Dict[str, Any]) -> None:
 
     if hasattr(audio, "info") and hasattr(audio.info, "length"):
         result["duration"] = float(audio.info.length)
+        codec = str(getattr(audio.info, "codec", "") or "").lower()
+        result["sample_rate"] = int(getattr(audio.info, "sample_rate", 0) or 0)
+        result["channels"] = int(getattr(audio.info, "channels", 0) or 0)
+        if codec.startswith("alac"):
+            result["bits_per_sample"] = int(getattr(audio.info, "bits_per_sample", 0) or 0)
+        else:
+            result["bits_per_sample"] = 0  # AAC: no real bit depth
 
     tags = audio.tags
     if not tags:
@@ -388,6 +411,9 @@ def _read_flac_tags(file_path: str, result: Dict[str, Any]) -> None:
 
     if hasattr(audio, "info") and hasattr(audio.info, "length"):
         result["duration"] = float(audio.info.length)
+        result["sample_rate"] = int(getattr(audio.info, "sample_rate", 0) or 0)
+        result["channels"] = int(getattr(audio.info, "channels", 0) or 0)
+        result["bits_per_sample"] = int(getattr(audio.info, "bits_per_sample", 0) or 0)
 
     def _get(keys: list) -> Optional[str]:
         for k in keys:
@@ -1019,7 +1045,15 @@ def get_audio_stream_info(file_path: str) -> Dict[str, Any]:
     """Returns sample_rate, bits_per_sample, duration, channels."""
     path = Path(file_path)
     ext = path.suffix.lower()
-    info = {"sample_rate": 44100, "bits_per_sample": 16, "duration": 0.0, "channels": 2}
+    info = {
+        "sample_rate": 44100,
+        # 0 means "not applicable": lossy codecs (MP3, AAC) have no real bit depth.
+        "bits_per_sample": 0,
+        "duration": 0.0,
+        "channels": 2,
+        "bitrate": 0,
+        "codec": "",
+    }
     try:
         if ext == ".flac":
             f = FLAC(file_path)
@@ -1027,29 +1061,49 @@ def get_audio_stream_info(file_path: str) -> Dict[str, Any]:
             info["bits_per_sample"] = f.info.bits_per_sample
             info["duration"] = f.info.length
             info["channels"] = f.info.channels
+            info["codec"] = "FLAC"
         elif ext == ".mp3":
             f = MP3(file_path)
             info["sample_rate"] = f.info.sample_rate
             info["duration"] = f.info.length
             info["channels"] = f.info.channels
+            info["codec"] = "MP3"
         elif ext in (".m4a", ".aac", ".mp4"):
             f = MP4(file_path)
+            codec = str(getattr(f.info, "codec", "") or "").lower()
             info["sample_rate"] = getattr(f.info, "sample_rate", 44100)
-            info["bits_per_sample"] = getattr(f.info, "bits_per_sample", 16)
             info["duration"] = f.info.length
             info["channels"] = getattr(f.info, "channels", 2)
+            if codec.startswith("alac"):
+                info["codec"] = "ALAC"
+                info["bits_per_sample"] = int(getattr(f.info, "bits_per_sample", 0) or 0)
+            else:
+                # AAC is lossy: the container's "sample size" field is not a bit depth.
+                info["codec"] = "AAC"
+                info["bits_per_sample"] = 0
         elif ext == ".wv":
             f = WavPack(file_path)
             info["sample_rate"] = f.info.sample_rate
             info["bits_per_sample"] = getattr(f.info, "bits_per_sample", 16)
             info["duration"] = f.info.length
             info["channels"] = getattr(f.info, "channels", 2)
+            info["codec"] = "WavPack"
         elif ext == ".ape":
             f = MonkeysAudio(file_path)
             info["sample_rate"] = f.info.sample_rate
             info["bits_per_sample"] = getattr(f.info, "bits_per_sample", 16)
             info["duration"] = f.info.length
             info["channels"] = getattr(f.info, "channels", 2)
+            info["codec"] = "APE"
+    except Exception:
+        pass
+
+    # Overall average bitrate of the stored file (kbps).
+    try:
+        size = path.stat().st_size
+        duration = float(info.get("duration") or 0)
+        if size > 0 and duration > 0:
+            info["bitrate"] = int(round(size * 8 / duration / 1000))
     except Exception:
         pass
     return info

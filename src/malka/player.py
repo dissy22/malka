@@ -15,6 +15,7 @@ from PyQt6.QtMultimedia import QAudioDevice, QMediaDevices
 
 import malka.config as config_module
 from malka.config import config
+from malka.formats import PLAYABLE_EXTS
 from malka.pcm_engine import PcmAudioService
 
 
@@ -41,7 +42,7 @@ def is_file_playable(file_path: str) -> Tuple[bool, str]:
     """
     Validates playback rules:
     - File exists
-    - Format is strictly .mp3 or .m4a
+    - Format is one of the library formats (.mp3, .m4a[+ALAC], .flac)
     - File resides inside one of the configured library folders
     """
     if not file_path:
@@ -52,8 +53,8 @@ def is_file_playable(file_path: str) -> Tuple[bool, str]:
         return False, f"File does not exist: {p.name}"
 
     ext = p.suffix.lower()
-    if ext not in (".mp3", ".m4a"):
-        return False, f"Unsupported format: {ext} (only .mp3 and .m4a can be played)"
+    if ext not in PLAYABLE_EXTS:
+        return False, f"Unsupported format: {ext} (only {', '.join(sorted(PLAYABLE_EXTS))} can be played)"
 
     if getattr(config, "library_paths", []):
         try:
@@ -193,7 +194,7 @@ class PlayerController(QObject):
                 playable_tracks.append(t)
 
         if not playable_tracks:
-            self.error_occurred.emit("No playable .mp3 or .m4a tracks found in this album.")
+            self.error_occurred.emit("No playable .mp3, .m4a or .flac tracks found in this album.")
             return False
 
         self.playlist = playable_tracks

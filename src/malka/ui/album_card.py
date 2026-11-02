@@ -42,7 +42,7 @@ class CoverLabel(QWidget):
         painter.drawPixmap(0, 0, self._pixmap)
         painter.end()
 
-from malka.config import NO_DATA
+from malka.config import NO_DATA, config
 from malka.ui.image_utils import (
     create_square_placeholder,
     get_cached_square_pixmap,
@@ -76,6 +76,8 @@ class AlbumCard(QFrame):
         self.track_count = album_data.get("track_count", 0)
         self.disc_count = album_data.get("disc_count", 1)
         self.has_bad_encoding = bool(album_data.get("has_bad_encoding", False))
+        # Album is "organized" when every track already sits at its canonical path.
+        self.is_organized = bool(album_data.get("is_organized", True))
         self.is_organize_ready = is_organize_ready
         self.organize_tooltip = organize_tooltip
         self.db_conn = db_conn
@@ -160,7 +162,7 @@ class AlbumCard(QFrame):
 
         # Bad encoding warning badge overlay on cover. Deliberately understated:
         # this is a metadata issue, not an audio/encoder problem.
-        if self.has_bad_encoding:
+        if self.has_bad_encoding and getattr(config, "show_encoding_badge", True):
             self.badge_encoding = QLabel(self.cover_label)
             self.badge_encoding.setText("Bad tags encoding")
             self.badge_encoding.setStyleSheet("""
@@ -181,6 +183,30 @@ class AlbumCard(QFrame):
             self.badge_encoding.adjustSize()
             self.badge_encoding.move(6, 6)
             self.badge_encoding.show()
+
+        # "Files need to be organized" badge, bottom-left so both can coexist.
+        if not self.is_organized and getattr(config, "show_organize_badge", True):
+            self.badge_organize = QLabel(self.cover_label)
+            self.badge_organize.setText("Files need to be organized")
+            self.badge_organize.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(13, 17, 23, 0.82);
+                    color: #e3b341;
+                    font-size: 6.5pt;
+                    font-weight: 600;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 1px 5px;
+                }
+            """)
+            self.badge_organize.setToolTip(
+                "These files are not in the library layout "
+                "(<Album artist>/<Year> - <Album>/<template>).\n"
+                "Right-click the album and choose \"Organize album files\"."
+            )
+            self.badge_organize.adjustSize()
+            self.badge_organize.move(6, 170 - self.badge_organize.height() - 6)
+            self.badge_organize.show()
 
         # Title Label
         self.title_label = QLabel()
@@ -321,6 +347,11 @@ class AlbumCard(QFrame):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
+        menu = self.build_context_menu()
+        menu.exec(event.globalPos())
+
+    def build_context_menu(self) -> QMenu:
+        """Builds (but does not show) the album context menu."""
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         self.context_menu = menu
@@ -377,10 +408,14 @@ class AlbumCard(QFrame):
             ready = True
 
         organize_action = QAction("Organize album files", self)
+        if self.is_organized:
+            ready = False
+            tooltip = "All files are already in the library layout"
         organize_action.setEnabled(ready)
         if not ready and tooltip:
             organize_action.setToolTip(tooltip)
         organize_action.triggered.connect(lambda: self.organize_requested.emit(self.album, self.album_artist))
+        self.organize_action = organize_action
         menu.addAction(organize_action)
 
         menu.addSeparator()
@@ -389,4 +424,4 @@ class AlbumCard(QFrame):
         open_folder_action.triggered.connect(lambda: self.open_folder_requested.emit(self.album, self.album_artist))
         menu.addAction(open_folder_action)
 
-        menu.exec(event.globalPos())
+        return menu

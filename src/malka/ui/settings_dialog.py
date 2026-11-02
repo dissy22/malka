@@ -285,6 +285,15 @@ class SettingsDialog(QDialog):
         self.scrollbars_checkbox.setChecked(getattr(config, "show_scrollbars", True))
         form.addRow("Scrollbars:", self.scrollbars_checkbox)
 
+        # Album card badges (some users prefer a clean grid)
+        self.organize_badge_checkbox = QCheckBox("Show “files need to be organized” badge")
+        self.organize_badge_checkbox.setChecked(getattr(config, "show_organize_badge", True))
+        form.addRow("Organize badge:", self.organize_badge_checkbox)
+
+        self.encoding_badge_checkbox = QCheckBox("Show “bad tags encoding” badge")
+        self.encoding_badge_checkbox.setChecked(getattr(config, "show_encoding_badge", True))
+        form.addRow("Encoding badge:", self.encoding_badge_checkbox)
+
         # Preview label
         self.preview_label = QLabel()
         self.preview_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
@@ -368,6 +377,8 @@ class SettingsDialog(QDialog):
         config.track_naming_format = new_tmpl
         config.theme = self.theme_combo.currentText().lower()
         config.show_scrollbars = self.scrollbars_checkbox.isChecked()
+        config.show_organize_badge = self.organize_badge_checkbox.isChecked()
+        config.show_encoding_badge = self.encoding_badge_checkbox.isChecked()
         config.save()
 
         self.settings_saved.emit()

@@ -21,7 +21,7 @@ from malka.importer import ImportAnalysisResult, execute_import
 class ImportWorker(QThread):
     """
     Background worker thread for executing album import without freezing the UI.
-    Handles Variant 1 (file copy + tagging) and Variant 2 (QAAC FLAC+CUE conversion).
+    Handles file copy + tagging as well as FFmpeg conversion (FLAC / ALAC / AAC / MP3) and CUE splitting.
     """
 
     progress_update = pyqtSignal(int, int, str, str, int)  # curr, total, msg, detail, pct
@@ -98,7 +98,7 @@ class ImportWorker(QThread):
 class ImportProgressDialog(QDialog):
     """
     Modal progress dialog with real-time encoding and import status updates.
-    Ensures 100% responsiveness and zero UI freezing during heavy QAAC conversions.
+    Ensures 100% responsiveness and zero UI freezing during heavy FFmpeg conversions.
     """
 
     def __init__(

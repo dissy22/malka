@@ -581,6 +581,8 @@ class BaseAlbumEditDialog(QDialog):
         # Compilation checkbox
         self.compilation_checkbox = QCheckBox("Compilation (Various Artists album)")
         self.compilation_checkbox.toggled.connect(self._on_compilation_toggled)
+        # Checkboxes are album-level controls too: keep the tracks in sync.
+        self.compilation_checkbox.toggled.connect(self._on_album_fields_changed)
         form.addRow("Compilation:", self.compilation_checkbox)
 
         # Artist row with Checkbox underneath
@@ -592,6 +594,7 @@ class BaseAlbumEditDialog(QDialog):
         artist_layout.addWidget(self.artist_edit)
         self.artist_same_checkbox = QCheckBox("Apply this Artist to all tracks in album")
         self.artist_same_checkbox.setChecked(True)
+        self.artist_same_checkbox.toggled.connect(self._on_album_fields_changed)
         artist_layout.addWidget(self.artist_same_checkbox)
         form.addRow("Artist:", artist_widget)
 
@@ -977,8 +980,11 @@ class EditAlbumDialog(BaseAlbumEditDialog):
         self.btn_action.clicked.connect(self._on_save)
 
     def _on_save(self):
+        # Album-tab edits are propagated live by the field signals; only the
+        # visible single-track form still has to be flushed. Calling
+        # _on_album_fields_changed() here would overwrite per-track edits
+        # (Year / Album / Album artist / Genre / Artist) with the album values.
         self._save_current_single_track_form()
-        self._on_album_fields_changed()
 
         album_cover_action = self.album_cover_widget.action
         album_new_cover = self.album_cover_widget.new_image_path
@@ -1025,6 +1031,8 @@ class EditAlbumDialog(BaseAlbumEditDialog):
                     remove_cover=remove_cov,
                 )
 
+                from malka.organizer import is_track_organized
+
                 db_data = {
                     "title": updated_tags["title"],
                     "artist": updated_tags["artist"],
@@ -1040,6 +1048,9 @@ class EditAlbumDialog(BaseAlbumEditDialog):
                     "cover_cache_path": updated_tags["cover_cache_path"],
                     "mtime": updated_tags["mtime"],
                     "bad_encoding": 0 if fix_enc else int(t.get("bad_encoding", 0)),
+                    "is_organized": 1 if is_track_organized(
+                        updated_tags, list(config.library_paths), config.track_naming_format, self.is_multi_disc
+                    ) else 0,
                 }
                 update_track(self.db_conn, t["id"], db_data)
 

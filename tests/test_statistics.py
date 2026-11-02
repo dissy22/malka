@@ -277,3 +277,108 @@ class TestStatistics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestArtistThumbnails(unittest.TestCase):
+    def test_artist_row_ignores_album_cover(self):
+        row = StatBarRow(
+            {"artist_name": "Queen", "image_path": "", "sample_cover": "/tmp/cover.jpg"},
+            1, 5, 5, 10, "tracks", "artist",
+        )
+        self.assertFalse(row._thumb_source)
+        self.assertFalse(row.thumb_lbl.pixmap().isNull())
+
+    def test_artist_row_uses_artist_image(self):
+        row = StatBarRow(
+            {"artist_name": "Queen", "image_path": "/tmp/artist.jpg",
+             "sample_cover": "/tmp/cover.jpg"},
+            1, 5, 5, 10, "tracks", "artist",
+        )
+        self.assertEqual(row._thumb_source, "/tmp/artist.jpg")
+
+    def test_album_row_still_uses_cover(self):
+        row = StatBarRow(
+            {"album": "A Night at the Opera", "album_artist": "Queen",
+             "cover_path": "/tmp/cover.jpg"},
+            1, 5, 5, 10, "tracks", "album",
+        )
+        self.assertEqual(row._thumb_source, "/tmp/cover.jpg")
+
+    def test_artist_initials(self):
+        self.assertEqual(StatBarRow._initials("Queen"), "QU")
+        self.assertEqual(StatBarRow._initials("Bill Brown & Jamie Christopherson"), "BC")
+        self.assertEqual(StatBarRow._initials(""), "🎤")
+
+
+class TestPlaceholderSharpness(unittest.TestCase):
+    def test_placeholder_is_drawn_at_screen_dpr(self):
+        row = StatBarRow({"artist_name": "Daft Punk"}, 1, 1, 1, 1, "tracks", "artist")
+        pix = row._create_placeholder(40)
+        dpr = app.primaryScreen().devicePixelRatio()
+        self.assertAlmostEqual(pix.devicePixelRatio(), dpr, places=2)
+        self.assertEqual(pix.width(), int(round(40 * dpr)))
+
+    def test_placeholder_circle_is_centred_not_clipped(self):
+        row = StatBarRow({"artist_name": "Daft Punk"}, 1, 1, 1, 1, "tracks", "artist")
+        pix = row._create_placeholder(40)
+        img = pix.toImage()
+        dpr = pix.devicePixelRatio()
+        center = img.pixelColor(img.width() // 2, img.height() // 2)
+        corner = img.pixelColor(1, 1)
+        self.assertGreater(center.alpha(), 0)
+        self.assertEqual(corner.alpha(), 0)
+        self.assertEqual(img.width(), int(round(40 * dpr)))
+
+    def test_round_pixmap_keeps_center_visible(self):
+        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtCore import Qt
+
+        row = StatBarRow({"artist_name": "Daft Punk"}, 1, 1, 1, 1, "tracks", "artist")
+        src = QPixmap(80, 80)
+        src.fill(Qt.GlobalColor.red)
+        src.setDevicePixelRatio(2.0)
+        out = row._round_pixmap(src, 40, is_circle=True)
+        img = out.toImage()
+        center = img.pixelColor(img.width() // 2, img.height() // 2)
+        corner = img.pixelColor(1, 1)
+        self.assertEqual(center.name(), "#ff0000")
+        self.assertEqual(corner.alpha(), 0)
+
+    def test_lanczos_resize_keeps_dpr(self):
+        from PyQt6.QtGui import QPixmap
+        from malka.ui.image_utils import resize_pixmap_lanczos
+
+        src = QPixmap(40, 40)
+        src.fill(Qt.GlobalColor.red)
+        src.setDevicePixelRatio(2.0)
+        out = resize_pixmap_lanczos(src, 80, 80)
+        self.assertEqual(out.width(), 80)
+        self.assertAlmostEqual(out.devicePixelRatio(), 2.0, places=2)
+
+
+class TestStatRowAlignment(unittest.TestCase):
+    def test_bars_have_equal_width_regardless_of_title_length(self):
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        long_row = StatBarRow(
+            {"album": "Lineage II Chronicle Ultimate Selection " * 3,
+             "album_artist": "Bill Brown", "year": "2011"},
+            1, 57, 57, 100, "tracks", "album", theme="dark",
+        )
+        short_row = StatBarRow(
+            {"album": "X", "album_artist": "A", "year": "1999"},
+            2, 10, 57, 100, "tracks", "album", theme="dark",
+        )
+        layout.addWidget(long_row)
+        layout.addWidget(short_row)
+        container.resize(1000, 200)
+        container.show()
+        app.processEvents()
+
+        self.assertEqual(long_row.bar_widget.width(), short_row.bar_widget.width())
+        self.assertEqual(long_row.badge_lbl.width(), short_row.badge_lbl.width())
+        # Long titles are elided instead of pushing the bars around.
+        self.assertTrue(long_row.title_lbl.text().endswith("…"))
+        self.assertEqual(long_row.title_lbl.toolTip(), "Lineage II Chronicle Ultimate Selection " * 3)

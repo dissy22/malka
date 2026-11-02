@@ -1,19 +1,22 @@
 import os
 from pathlib import Path
-from typing import Iterable, List, Set, Union
+from typing import Iterable, List, Optional, Set, Union
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from malka.config import NO_DATA
+from malka.config import NO_DATA, config
 from malka.db import (
     delete_missing_tracks,
     get_cached_mtimes,
     get_connection,
     upsert_track,
 )
+from malka.formats import LIBRARY_EXTS
+from malka.organizer import refresh_organization_flags
 from malka.tags import read_tags
 
-SUPPORTED_EXTS = {".mp3", ".m4a", ".aac", ".mp4", ".flac", ".wv", ".ape"}
+#: The library stores only MP3, AAC/ALAC-in-M4A and FLAC files.
+SUPPORTED_EXTS = LIBRARY_EXTS
 
 
 class LibraryScanner(QThread):
@@ -22,7 +25,13 @@ class LibraryScanner(QThread):
     finished_scan = pyqtSignal(int, int)  # total_scanned, deleted_count
     error = pyqtSignal(str)
 
-    def __init__(self, library_path: Union[str, Path, Iterable[str]], db_path: str, force_rescan: bool = False):
+    def __init__(
+        self,
+        library_path: Union[str, Path, Iterable[str]],
+        db_path: str,
+        force_rescan: bool = False,
+        naming_format: Optional[str] = None,
+    ):
         super().__init__()
         if isinstance(library_path, (str, Path)):
             paths = [str(library_path)]
@@ -32,6 +41,7 @@ class LibraryScanner(QThread):
         self.library_path = paths[0] if paths else ""
         self.db_path = db_path
         self.force_rescan = force_rescan
+        self.naming_format = naming_format
         self._is_cancelled = False
 
     def cancel(self):
@@ -148,6 +158,15 @@ class LibraryScanner(QThread):
 
             self.status_text.emit("Synchronizing deleted files...")
             deleted_count = delete_missing_tracks(conn, scanned_paths)
+
+            # Recompute the "files need to be organized" flag for the library layout.
+            template = self.naming_format or getattr(config, "track_naming_format", "<track_no>. <title>")
+            try:
+                # Use every configured root (not just currently mounted ones) so
+                # tracks on an unplugged drive keep their "organized" state.
+                refresh_organization_flags(conn, list(self.library_paths), template)
+            except Exception as exc:
+                print(f"Failed to refresh organization flags: {exc}")
 
             self.finished_scan.emit(total_files, deleted_count)
         except Exception as e:
