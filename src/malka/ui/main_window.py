@@ -1,0 +1,2605 @@
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
+from PyQt6.QtGui import QAction, QActionGroup, QFont, QIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QStackedWidget,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+import malka.config as config_module
+from malka.config import NO_DATA, config
+from malka.db import (
+    album_sort_key,
+    categorize_album,
+    get_album_tracks,
+    get_albums_by_artist,
+    get_albums_by_genre,
+    get_all_albums,
+    get_all_artists,
+    get_all_genres,
+    get_connection,
+    init_db,
+    set_artist_image,
+    sort_albums,
+    sort_artists,
+    sort_genres,
+)
+from malka.importer import analyze_import_folder, execute_import
+from malka.organizer import is_album_ready_to_organize, organize_album
+from malka.player import PlayerController
+from malka.scanner import LibraryScanner
+from malka.ui.album_card import AlbumCard
+from malka.ui.album_detail_view import AlbumDetailView
+from malka.ui.artist_card import ArtistCard
+from malka.ui.breadcrumb_bar import BreadcrumbBar
+from malka.ui.edit_dialog import EditAlbumDialog
+from malka.ui.file_utils import open_folder, reveal_file
+from malka.ui.flow_layout import FlowLayout
+from malka.ui.genre_card import GenreCard
+from malka.ui.import_dialog import ImportDialog
+from malka.ui.import_progress_dialog import ImportProgressDialog
+from malka.ui.player_sidebar import PlayerSidebar
+from malka.ui.section_header import SectionHeaderWidget
+from malka.ui.settings_dialog import SettingsDialog
+from malka.ui.statistics_view import StatisticsView
+from malka.ui.title_bar import CustomTitleBar
+
+
+class NavRowWidget(QWidget):
+    """
+    Navigation row widget that keeps the View Switcher (Artists | Albums | Genres)
+    strictly and mathematically centered at (width - switcher_width) // 2 at all times,
+    while accommodating the breadcrumb / back button on the left and Sort button on the right
+    without shifting the switcher.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.breadcrumb_bar: Optional[QWidget] = None
+        self.view_switcher_frame: Optional[QWidget] = None
+        self.sort_button: Optional[QWidget] = None
+        self.setFixedHeight(36)
+
+    def set_widgets(
+        self,
+        breadcrumb_bar: QWidget,
+        view_switcher_frame: QWidget,
+        sort_button: Optional[QWidget] = None,
+    ):
+        self.breadcrumb_bar = breadcrumb_bar
+        self.view_switcher_frame = view_switcher_frame
+        self.sort_button = sort_button
+
+        self.breadcrumb_bar.setParent(self)
+        self.view_switcher_frame.setParent(self)
+        self.breadcrumb_bar.installEventFilter(self)
+
+        if self.sort_button:
+            self.sort_button.setParent(self)
+            self.sort_button.installEventFilter(self)
+
+        self.update_positions()
+
+    def eventFilter(self, obj, event):
+        if obj in (self.breadcrumb_bar, self.sort_button) and event.type() in (QEvent.Type.Show, QEvent.Type.Hide):
+            self.update_positions()
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_positions()
+
+    def update_positions(self):
+        w = self.width()
+        h = self.height()
+        if not self.view_switcher_frame:
+            return
+
+        sw_size = self.view_switcher_frame.sizeHint()
+        sw_w = max(sw_size.width(), 260)
+        sw_h = 32
+        cx = (w - sw_w) // 2
+        cy = (h - sw_h) // 2
+        self.view_switcher_frame.setGeometry(cx, cy, sw_w, sw_h)
+
+        if self.breadcrumb_bar and self.breadcrumb_bar.isVisible():
+            max_bc_w = max(0, cx - 12)
+            self.breadcrumb_bar.setGeometry(0, 0, max_bc_w, h)
+
+        if self.sort_button and self.sort_button.isVisible():
+            sb_size = self.sort_button.sizeHint()
+            sb_w = max(sb_size.width() + 16, 76)
+            sb_h = 30
+            sb_x = w - sb_w - 4
+            sb_y = (h - sb_h) // 2
+            self.sort_button.setGeometry(sb_x, sb_y, sb_w, sb_h)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, check_first_launch: bool = True):
+        super().__init__()
+        self.setWindowTitle("Malka — Music Library Organizer")
+        self.resize(1050, 750)
+        self.setMinimumSize(800, 550)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self.setMouseTracking(True)
+        self.theme: str = getattr(config, "theme", "dark")
+
+        # Database connection & state
+        init_db(config.db_path)
+        self.db_conn = get_connection(config.db_path)
+        self.scanner_thread: Optional[LibraryScanner] = None
+        self.all_albums_cache: List[Dict[str, Any]] = []
+        self.all_artists_cache: List[Dict[str, Any]] = []
+        self.all_genres_cache: List[Dict[str, Any]] = []
+        # Keep rendered grid widgets alive so switching Artists/Albums/Genres is
+        # instant instead of destroying and re-creating hundreds of cards.
+        self._view_caches: Dict[str, Dict[str, Any]] = {}
+        self._data_revision: int = 0
+        self._cover_queue: List[AlbumCard] = []
+        self._cover_queue_index: int = 0
+        self._cover_queue_token: int = 0
+        self._cover_queue_active: bool = False
+        self._album_build_depth: int = 0
+        self._album_refresh_pending: bool = False
+        self._incremental_albums: Optional[Dict[str, Any]] = None
+        self._album_render_token: int = 0
+        self.album_page: int = 0
+        self.album_page_size: int = 300
+        self._cover_scroll_timer = QTimer(self)
+        self._cover_scroll_timer.setSingleShot(True)
+        self._cover_scroll_timer.setInterval(30)
+        self._cover_scroll_timer.timeout.connect(self._load_visible_covers)
+        self.current_view: str = "albums"  # "artists", "albums", "genres", "album_detail"
+        self.prev_view: str = "albums"
+        self._closing: bool = False
+        self._config_target = getattr(config_module, "CONFIG_FILE", None)
+        self.artist_filter: Optional[str] = None
+        self.genre_filter: Optional[str] = None
+        self.is_stats_mode: bool = False
+        self.album_sort_mode: str = getattr(config, "album_sort_mode", "artist_year")
+        self.artist_sort_mode: str = getattr(config, "artist_sort_mode", "name_asc")
+        self.genre_sort_mode: str = getattr(config, "genre_sort_mode", "name_asc")
+
+        # Audio player controller
+        self.player_controller = PlayerController(self)
+        self.player_controller.error_occurred.connect(self._on_player_error)
+        self.player_controller.playback_stopped.connect(self._on_playback_stopped)
+
+        # Search debounce timer (150ms)
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(150)
+        self.search_timer.timeout.connect(self.refresh_current_view)
+
+        self.init_ui()
+        self.apply_theme(self.theme)
+
+        # Handle first launch check
+        if check_first_launch:
+            QTimer.singleShot(100, self._check_first_launch)
+
+        # Restore the previous playback session (paused, without auto-play).
+        if getattr(config, "playback_state", None):
+            QTimer.singleShot(250, self._restore_playback_session)
+
+    def init_ui(self):
+        central_widget = QWidget()
+        central_widget.setObjectName("centralWidget")
+        self.setCentralWidget(central_widget)
+
+        root_layout = QVBoxLayout(central_widget)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # Custom Title Bar
+        self.title_bar = CustomTitleBar(self)
+        root_layout.addWidget(self.title_bar)
+
+        content_widget = QWidget()
+        content_widget.setObjectName("contentWidget")
+        content_widget.setMouseTracking(True)
+        main_layout = QVBoxLayout(content_widget)
+        main_layout.setContentsMargins(16, 10, 16, 8)
+        main_layout.setSpacing(12)
+
+        # Top Bar
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(10)
+
+        self.btn_select_dir = QPushButton("📁 Add Library Folder")
+        self.btn_select_dir.setProperty("class", "topBtn")
+        self.btn_select_dir.clicked.connect(self._on_select_directory)
+        top_bar.addWidget(self.btn_select_dir)
+
+        self.btn_import = QPushButton("📥 Import Album")
+        self.btn_import.setProperty("class", "topBtn")
+        self.btn_import.clicked.connect(self._on_click_import)
+        top_bar.addWidget(self.btn_import)
+
+        self.btn_rescan = QPushButton("🔄 Rescan Library")
+        self.btn_rescan.setProperty("class", "topBtn")
+        self.btn_rescan.clicked.connect(lambda: self.start_scanning(force=True))
+        top_bar.addWidget(self.btn_rescan)
+
+        self.btn_settings = QPushButton("⚙️ Settings")
+        self.btn_settings.setProperty("class", "topBtn")
+        self.btn_settings.clicked.connect(self._on_open_settings)
+        top_bar.addWidget(self.btn_settings)
+
+        self.btn_stats = QPushButton("📊 Statistics")
+        self.btn_stats.setObjectName("btnStats")
+        self.btn_stats.setProperty("class", "topBtn")
+        self.btn_stats.setCheckable(True)
+        self.btn_stats.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stats.toggled.connect(self._on_toggle_statistics)
+        top_bar.addWidget(self.btn_stats)
+
+        top_bar.addStretch()
+
+        # Search field
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("searchEdit")
+        self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textEdited.connect(self._on_search_text_edited)
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
+        top_bar.addWidget(self.search_edit)
+
+        main_layout.addLayout(top_bar)
+
+        # Navigation & View Switcher Row (single line: clickable library path on the left,
+        # view switcher permanently centered, sort button on the right).
+        self.breadcrumb_bar = BreadcrumbBar(content_widget)
+        self.breadcrumb_bar.hide()
+
+        # Center: Segmented View Switcher (Artists | Albums | Genres)
+        self.view_switcher_frame = QFrame()
+        self.view_switcher_frame.setObjectName("viewSwitcherFrame")
+        self.view_switcher_frame.setFixedHeight(32)
+        self.view_switcher_frame.setStyleSheet("""
+            QFrame#viewSwitcherFrame {
+                background-color: #1a1e24;
+                border: none;
+                border-radius: 7px;
+            }
+        """)
+
+        view_switcher_layout = QHBoxLayout(self.view_switcher_frame)
+        view_switcher_layout.setContentsMargins(3, 3, 3, 3)
+        view_switcher_layout.setSpacing(0)
+
+        self.btn_view_artists = QPushButton("Artists")
+        self.btn_view_albums = QPushButton("Albums")
+        self.btn_view_genres = QPushButton("Genres")
+
+        for btn in (self.btn_view_artists, self.btn_view_albums, self.btn_view_genres):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.btn_view_artists.clicked.connect(lambda: self.set_view("artists"))
+        self.btn_view_albums.clicked.connect(lambda: self.set_view("albums"))
+        self.btn_view_genres.clicked.connect(lambda: self.set_view("genres"))
+
+        view_switcher_layout.addWidget(self.btn_view_artists)
+        view_switcher_layout.addWidget(self.btn_view_albums)
+        view_switcher_layout.addWidget(self.btn_view_genres)
+
+        # Right: Sort button (opens context menu with sorting options)
+        self.btn_sort = QPushButton("Sort ▾")
+        self.btn_sort.setObjectName("btnSort")
+        self.btn_sort.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort.clicked.connect(self._show_sort_menu)
+
+        self.nav_row_widget = NavRowWidget(content_widget)
+        self.nav_row_widget.set_widgets(self.breadcrumb_bar, self.view_switcher_frame, self.btn_sort)
+        main_layout.addWidget(self.nav_row_widget)
+
+        self._update_view_buttons_style()
+
+        # Center Body Area: Split horizontally into (Main Content Stack | Player Sidebar)
+        body_layout = QHBoxLayout()
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(14)
+
+        # Main Stack: Index 0 = Grid Scroll Area, Index 1 = Album Detail View
+        self.main_stack = QStackedWidget()
+
+        # Page 0: Catalog pages. Each view keeps its own scroll container and
+        # FlowLayout, so switching between Artists/Albums/Genres never has to
+        # detach and re-add thousands of album tiles.
+        (
+            self._albums_page,
+            self._albums_scroll_area,
+            self._albums_pager_header,
+            self._albums_pager_layout,
+        ) = self._make_catalog_page()
+        (
+            self._artists_page,
+            self._artists_scroll_area,
+            self._artists_pager_header,
+            self._artists_pager_layout,
+        ) = self._make_catalog_page()
+        (
+            self._genres_page,
+            self._genres_scroll_area,
+            self._genres_pager_header,
+            self._genres_pager_layout,
+        ) = self._make_catalog_page()
+
+        self._albums_container_widget = self._albums_scroll_area.widget()
+        self._artists_container_widget = self._artists_scroll_area.widget()
+        self._genres_container_widget = self._genres_scroll_area.widget()
+        self._albums_flow_layout = self._albums_container_widget.layout()
+        self._artists_flow_layout = self._artists_container_widget.layout()
+        self._genres_flow_layout = self._genres_container_widget.layout()
+
+        self.catalog_stack = QStackedWidget()
+        self.catalog_stack.addWidget(self._albums_page)
+        self.catalog_stack.addWidget(self._artists_page)
+        self.catalog_stack.addWidget(self._genres_page)
+        self.catalog_stack.setCurrentWidget(self._albums_page)
+        for _sa in (self._albums_scroll_area, self._artists_scroll_area, self._genres_scroll_area):
+            _sa.verticalScrollBar().valueChanged.connect(self._schedule_visible_covers)
+            _sa.viewport().installEventFilter(self)
+        self.main_stack.addWidget(self.catalog_stack)
+
+        # Page 1: Album Detail View
+        self.album_detail_view = AlbumDetailView(self.player_controller, self.db_conn)
+        self.album_detail_view.track_play_requested.connect(self._on_track_play_requested)
+        self.album_detail_view.track_location_requested.connect(self._on_track_location_requested)
+        self.main_stack.addWidget(self.album_detail_view)
+
+        # Page 2: Statistics View
+        self.statistics_view = StatisticsView(self.db_conn, theme=self.theme)
+        self.statistics_view.artist_selected.connect(self._on_stat_artist_selected)
+        self.statistics_view.album_selected.connect(self._on_stat_album_selected)
+        self.statistics_view.genre_selected.connect(self._on_stat_genre_selected)
+        self.main_stack.addWidget(self.statistics_view)
+
+        body_layout.addWidget(self.main_stack, 1)
+
+        # Persistent Player Sidebar on the right (hidden until playback starts)
+        self.player_sidebar = PlayerSidebar(self.player_controller)
+        self.player_sidebar.artist_clicked.connect(self._on_sidebar_artist_clicked)
+        self.player_sidebar.album_clicked.connect(self._on_sidebar_album_clicked)
+        self.player_sidebar.hide()
+        body_layout.addWidget(self.player_sidebar)
+
+        main_layout.addLayout(body_layout, 1)
+        root_layout.addWidget(content_widget, 1)
+
+        # Enable Drag-and-Drop
+        self.setAcceptDrops(True)
+
+        # Empty state message labels (one per catalog page)
+        self.empty_label = QLabel(self._albums_container_widget)
+        self._artists_empty_label = QLabel(self._artists_container_widget)
+        self._genres_empty_label = QLabel(self._genres_container_widget)
+        for lbl in (self.empty_label, self._artists_empty_label, self._genres_empty_label):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setFont(QFont("Segoe UI", 12))
+            lbl.setStyleSheet("color: #666666; padding: 40px;")
+            lbl.setText("Music library is empty. Select a library folder or drag and drop an album folder here to import.")
+            lbl.hide()
+
+        # Status Bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+        self.status_info_label = QLabel("Ready")
+        self.status_info_label.setStyleSheet("color: #aaaaaa; margin-left: 8px;")
+        self.status_bar.addWidget(self.status_info_label, 1)
+
+        self.scan_status_label = QLabel("")
+        self.scan_status_label.setStyleSheet("color: #888888; margin-right: 8px;")
+        self.status_bar.addPermanentWidget(self.scan_status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.status_bar.addPermanentWidget(self.progress_bar)
+
+    def _check_first_launch(self):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.db_conn.execute("SELECT 1")
+        except Exception:
+            return
+        existing = [p for p in config.library_paths if Path(p).exists()]
+        if not existing:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Welcome to Malka")
+            msg.setText("Please select your music library folder to get started.")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg.exec()
+            self._on_select_directory()
+        else:
+            self.refresh_library_view()
+            if not self.all_albums_cache:
+                self.start_scanning(force=False)
+
+    def _make_catalog_page(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        header = QWidget(page)
+        header.setObjectName("catalogPager")
+        header.hide()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 10, 8, 10)
+        header_layout.setSpacing(6)
+        header_layout.addStretch(1)
+        header_layout.addStretch(1)
+        page_layout.addWidget(header)
+
+        scroll = QScrollArea()
+        # The flow layout computes its own height; letting QScrollArea resize
+        # the widget as well creates a width/height feedback loop on big grids.
+        scroll.setWidgetResizable(False)
+        scroll.setAcceptDrops(False)
+        container = QWidget()
+        container.setObjectName("scrollContainer")
+        container.setAcceptDrops(False)
+        layout = FlowLayout(container, margin=10, h_spacing=18, v_spacing=18)
+        container.setLayout(layout)
+        scroll.setWidget(container)
+        page_layout.addWidget(scroll, 1)
+        return page, scroll, header, header_layout
+
+    def _catalog_page_index(self, view_name: Optional[str] = None) -> int:
+        view = view_name or self.current_view
+        if view == "artists":
+            return 1
+        if view == "genres":
+            return 2
+        return 0
+
+    @property
+    def flow_layout(self) -> FlowLayout:
+        if self.current_view == "artists":
+            return self._artists_flow_layout
+        if self.current_view == "genres":
+            return self._genres_flow_layout
+        return self._albums_flow_layout
+
+    @property
+    def container_widget(self) -> QWidget:
+        if self.current_view == "artists":
+            return self._artists_container_widget
+        if self.current_view == "genres":
+            return self._genres_container_widget
+        return self._albums_container_widget
+
+    @property
+    def scroll_area(self) -> QScrollArea:
+        if self.current_view == "artists":
+            return self._artists_scroll_area
+        if self.current_view == "genres":
+            return self._genres_scroll_area
+        return self._albums_scroll_area
+
+    def _active_empty_label(self) -> QLabel:
+        if self.current_view == "artists":
+            return self._artists_empty_label
+        if self.current_view == "genres":
+            return self._genres_empty_label
+        return self.empty_label
+
+    def _set_catalog_page(self, view_name: str):
+        self.catalog_stack.setCurrentIndex(self._catalog_page_index(view_name))
+
+    def _restore_playback_session(self):
+        if getattr(self, "_closing", False):
+            return
+        state = getattr(config, "playback_state", None)
+        if not isinstance(state, dict):
+            return
+        try:
+            restored = self.player_controller.restore_playback_state(state)
+        except Exception:
+            restored = False
+        if restored:
+            self.player_sidebar.show()
+        else:
+            config.playback_state = None
+
+    def _on_select_directory(self):
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Add Music Library Folder",
+            config.library_path or str(Path.home()),
+        )
+        if directory:
+            added = config.add_library_path(directory)
+            config.save()
+            if added:
+                self.status_info_label.setText(f"Added library folder: {directory}")
+            self.start_scanning(force=True)
+
+    def _on_open_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.settings_saved.connect(self._on_settings_saved)
+        dlg.exec()
+
+    def _on_settings_saved(self):
+        self.apply_theme(getattr(config, "theme", "dark"))
+        self.update_scrollbars()
+        self.refresh_library_view()
+
+    def update_scrollbars(self):
+        show = getattr(config, "show_scrollbars", True)
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if show else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        for sa in (self._albums_scroll_area, self._artists_scroll_area, self._genres_scroll_area):
+            sa.setVerticalScrollBarPolicy(policy)
+            sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if hasattr(self, "album_detail_view") and hasattr(self.album_detail_view, "update_scrollbars"):
+            self.album_detail_view.update_scrollbars()
+        if hasattr(self, "statistics_view") and hasattr(self.statistics_view, "update_scrollbars"):
+            self.statistics_view.update_scrollbars()
+
+    def start_scanning(self, force: bool = False):
+        existing_roots = [p for p in config.library_paths if Path(p).exists()]
+        if not existing_roots:
+            QMessageBox.warning(self, "Warning", "Please select a valid library folder first.")
+            return
+
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            return
+
+        self.btn_rescan.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.scan_status_label.setText("Preparing to scan...")
+
+        self.scanner_thread = LibraryScanner(config.library_paths, config.db_path, force_rescan=force)
+        self.scanner_thread.progress.connect(self._on_scan_progress)
+        self.scanner_thread.status_text.connect(self._on_scan_status_text)
+        self.scanner_thread.finished_scan.connect(self._on_scan_finished)
+        self.scanner_thread.error.connect(self._on_scan_error)
+        self.scanner_thread.start()
+
+    def _on_scan_progress(self, current: int, total: int, filename: str):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        disp_name = filename if len(filename) < 30 else filename[:27] + "..."
+        self.scan_status_label.setText(f"{current}/{total}: {disp_name}")
+
+    def _on_scan_status_text(self, text: str):
+        self.scan_status_label.setText(text)
+
+    def _on_scan_finished(self, total: int, deleted: int):
+        self.progress_bar.setVisible(False)
+        self.scan_status_label.setText(f"Scan completed: {total} files")
+        self.btn_rescan.setEnabled(True)
+        self.refresh_library_view()
+
+    def _on_scan_error(self, err_msg: str):
+        self.progress_bar.setVisible(False)
+        self.btn_rescan.setEnabled(True)
+        QMessageBox.critical(self, "Scan Error", err_msg)
+
+    def set_view(self, view_name: str):
+        if view_name not in ("artists", "albums", "genres"):
+            return
+        self.current_view = view_name
+        self.prev_view = view_name
+        if hasattr(self, "album_page"):
+            self.album_page = 0
+        self.artist_filter = None
+        self.genre_filter = None
+        self._update_view_buttons_style()
+
+        if getattr(self, "is_stats_mode", False):
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.hide()
+            if hasattr(self, "breadcrumb_bar"):
+                self.breadcrumb_bar.hide()
+            if hasattr(self, "statistics_view"):
+                self.main_stack.setCurrentWidget(self.statistics_view)
+                self.statistics_view.set_category(view_name)
+            return
+
+        if hasattr(self, "main_stack") and self.main_stack.currentIndex() != 0:
+            self.main_stack.setCurrentIndex(0)
+        if hasattr(self, "catalog_stack"):
+            self._set_catalog_page(view_name)
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.show()
+
+        if view_name == "artists":
+            self.search_edit.setPlaceholderText("🔍 Search artists...")
+        elif view_name == "genres":
+            self.search_edit.setPlaceholderText("🔍 Search genres...")
+        else:
+            self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+
+        self._update_breadcrumb()
+        self.refresh_current_view()
+
+    def _on_toggle_statistics(self, checked: bool):
+        self.is_stats_mode = checked
+        if checked:
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.hide()
+            if hasattr(self, "breadcrumb_bar"):
+                self.breadcrumb_bar.hide()
+            self.main_stack.setCurrentWidget(self.statistics_view)
+            self.statistics_view.set_category(self.current_view if self.current_view in ("artists", "albums", "genres") else "albums")
+        else:
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.setVisible(self.current_view == "albums" and not self.artist_filter and not self.genre_filter)
+            if self.current_view == "album_detail":
+                self.main_stack.setCurrentWidget(self.album_detail_view)
+            else:
+                self._set_catalog_page(self.current_view)
+                self.main_stack.setCurrentWidget(self.catalog_stack)
+            self._update_breadcrumb()
+            if self.current_view != "album_detail":
+                self.refresh_current_view()
+                self._update_status_bar_info()
+
+    def _on_stat_artist_selected(self, artist_name: str):
+        self.btn_stats.setChecked(False)
+        self.set_view("artists")
+        self._on_artist_clicked(artist_name)
+
+    def _on_stat_album_selected(self, album_name: str, album_artist: str):
+        self.btn_stats.setChecked(False)
+        target_alb = album_name.strip().lower()
+        target_art = album_artist.strip().lower()
+        match = next(
+            (a for a in self.all_albums_cache 
+             if a["album"].strip().lower() == target_alb and 
+                (not target_art or a["album_artist"].strip().lower() == target_art or a.get("display_artist", "").strip().lower() == target_art)),
+            None
+        )
+        if match:
+            self._on_album_clicked(match)
+        else:
+            album_data = {
+                "album": album_name,
+                "album_artist": album_artist,
+                "display_artist": album_artist,
+            }
+            self._on_album_clicked(album_data)
+
+    def _on_stat_genre_selected(self, genre_name: str):
+        self.btn_stats.setChecked(False)
+        self.set_view("genres")
+        self._on_genre_clicked(genre_name)
+
+    def _update_view_buttons_style(self):
+        is_light = getattr(self, "theme", "dark") == "light"
+        if is_light:
+            active_style = """
+                QPushButton {
+                    background-color: #ffffff;
+                    color: #1f2328;
+                    font-weight: 600;
+                    font-size: 8.5pt;
+                    border-radius: 5px;
+                    border: none;
+                    padding: 0px 14px;
+                    min-height: 26px;
+                    max-height: 26px;
+                }
+            """
+            inactive_style = """
+                QPushButton {
+                    background-color: transparent;
+                    color: #656d76;
+                    font-weight: 500;
+                    font-size: 8.5pt;
+                    border-radius: 5px;
+                    border: none;
+                    padding: 0px 14px;
+                    min-height: 26px;
+                    max-height: 26px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(0, 0, 0, 0.05);
+                    border: none;
+                    color: #1f2328;
+                }
+                QPushButton:pressed {
+                    background-color: rgba(0, 0, 0, 0.10);
+                    border: none;
+                }
+            """
+        else:
+            active_style = """
+                QPushButton {
+                    background-color: #0b0d10;
+                    color: #ffffff;
+                    font-weight: 600;
+                    font-size: 8.5pt;
+                    border-radius: 5px;
+                    border: none;
+                    padding: 0px 14px;
+                    min-height: 26px;
+                    max-height: 26px;
+                }
+            """
+            inactive_style = """
+                QPushButton {
+                    background-color: transparent;
+                    color: #8b949e;
+                    font-weight: 500;
+                    font-size: 8.5pt;
+                    border-radius: 5px;
+                    border: none;
+                    padding: 0px 14px;
+                    min-height: 26px;
+                    max-height: 26px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(255, 255, 255, 0.08);
+                    border: none;
+                    color: #c9d1d9;
+                }
+                QPushButton:pressed {
+                    background-color: rgba(255, 255, 255, 0.12);
+                    border: none;
+                }
+            """
+        self.btn_view_artists.setStyleSheet(active_style if self.current_view == "artists" else inactive_style)
+        self.btn_view_albums.setStyleSheet(active_style if self.current_view == "albums" else inactive_style)
+        self.btn_view_genres.setStyleSheet(active_style if self.current_view == "genres" else inactive_style)
+
+    # ------------------------------------------------------------------
+    # Breadcrumb navigation
+    # ------------------------------------------------------------------
+    def _go_all_albums(self):
+        self.set_view("albums")
+
+    def _go_to_artist(self, artist_name: str):
+        if not artist_name:
+            return
+        if getattr(self, "is_stats_mode", False):
+            self.btn_stats.setChecked(False)
+        self.current_view = "albums"
+        self.prev_view = "albums"
+        self.album_page = 0
+        self.artist_filter = artist_name
+        self.genre_filter = None
+        self.main_stack.setCurrentIndex(0)
+        self._set_catalog_page("albums")
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.show()
+        self._update_view_buttons_style()
+        self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self._update_breadcrumb()
+        self.refresh_current_view()
+
+    def _go_to_genre(self, genre_name: str):
+        if not genre_name:
+            return
+        if getattr(self, "is_stats_mode", False):
+            self.btn_stats.setChecked(False)
+        self.current_view = "albums"
+        self.prev_view = "albums"
+        self.album_page = 0
+        self.genre_filter = genre_name
+        self.artist_filter = None
+        self.main_stack.setCurrentIndex(0)
+        self._set_catalog_page("albums")
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.show()
+        self._update_view_buttons_style()
+        self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self._update_breadcrumb()
+        self.refresh_current_view()
+
+    def _album_artist_for_breadcrumb(self) -> str:
+        if self.current_view != "album_detail":
+            return ""
+        if hasattr(self, "album_detail_view"):
+            data = self.album_detail_view.album_data or {}
+            artist = (data.get("display_artist") or data.get("album_artist") or "").strip()
+            if artist and artist != NO_DATA:
+                return artist
+        if self.artist_filter:
+            return self.artist_filter
+        return ""
+
+    def _album_title_for_breadcrumb(self) -> str:
+        if self.current_view != "album_detail":
+            return ""
+        if hasattr(self, "album_detail_view"):
+            data = self.album_detail_view.album_data or {}
+            title = (data.get("album") or "").strip()
+            if title and title != NO_DATA:
+                return title
+        return ""
+
+    def _update_breadcrumb(self):
+        """
+        Builds the clickable library path shown left of the view switcher:
+        ``All albums / Artist / Album /``.
+        """
+        if not hasattr(self, "breadcrumb_bar"):
+            return
+
+        if getattr(self, "is_stats_mode", False):
+            self.breadcrumb_bar.hide()
+            return
+
+        segments = []
+        if self.current_view == "album_detail":
+            segments.append(("All albums", self._go_all_albums))
+            artist = self._album_artist_for_breadcrumb()
+            if artist:
+                segments.append((artist, lambda name=artist: self._go_to_artist(name)))
+            title = self._album_title_for_breadcrumb()
+            if title:
+                segments.append((title, None))
+        elif self.current_view == "albums" and self.artist_filter:
+            segments.append(("All albums", self._go_all_albums))
+            segments.append((self.artist_filter, None))
+        elif self.current_view == "albums" and self.genre_filter:
+            segments.append(("All albums", self._go_all_albums))
+            segments.append((self.genre_filter, None))
+
+        if not segments:
+            self.breadcrumb_bar.hide()
+            return
+
+        self.breadcrumb_bar.set_path(segments)
+        self.breadcrumb_bar.show()
+        if hasattr(self, "nav_row_widget"):
+            self.nav_row_widget.update_positions()
+
+    def _on_back_clicked(self):
+        """Programmatic "go up one level" (keyboard/backward-compatible helper)."""
+        if self.current_view == "album_detail":
+            artist = self._album_artist_for_breadcrumb()
+            if artist:
+                self._go_to_artist(artist)
+            else:
+                self._go_all_albums()
+            return
+        if self.artist_filter:
+            self._go_all_albums()
+        elif self.genre_filter:
+            self._go_all_albums()
+        else:
+            self.set_view("albums")
+
+    def _on_album_clicked(self, album_data: Dict[str, Any]):
+        if self.current_view != "album_detail":
+            self.prev_view = self.current_view
+        self.current_view = "album_detail"
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.hide()
+        self._update_view_buttons_style()
+
+        self.album_detail_view.set_album(album_data)
+        self.main_stack.setCurrentIndex(1)
+
+        alb_artist = (album_data.get("display_artist") or album_data.get("album_artist", "")).strip()
+        alb_genre = (album_data.get("genre") or "").strip()
+
+        if alb_artist and alb_artist != NO_DATA:
+            self.artist_filter = alb_artist
+        else:
+            self.artist_filter = None
+        if self.genre_filter:
+            if not (alb_genre and alb_genre.lower() == self.genre_filter.lower()):
+                self.genre_filter = None
+
+        self._update_breadcrumb()
+
+    def _on_track_play_requested(self, track: Dict[str, Any], album_data: Dict[str, Any], all_tracks: List[Dict[str, Any]]):
+        if track and track.get("file_path"):
+            ok = self.player_controller.play_track(track, album_data, all_tracks)
+        else:
+            ok = self.player_controller.play_album(album_data, all_tracks)
+
+        if ok:
+            self.player_sidebar.show()
+
+    def _on_player_error(self, message: str):
+        self.status_bar.showMessage(f"Playback Notice: {message}", 5000)
+
+    def _on_playback_stopped(self):
+        if getattr(self, "_closing", False):
+            return
+        # Stop was explicit (or the album ended): do not restore this session
+        # on the next launch.  Persist the removal only when the config target
+        # is still the one this window was created with.
+        config.playback_state = None
+        try:
+            current_target = getattr(config_module, "CONFIG_FILE", None)
+            if current_target == getattr(self, "_config_target", current_target):
+                config.save_runtime_state()
+        except Exception:
+            pass
+
+    def _on_sidebar_artist_clicked(self, artist_name: str):
+        if not artist_name:
+            return
+        if hasattr(self, "main_stack") and self.main_stack.currentIndex() != 0:
+            self.main_stack.setCurrentIndex(0)
+        self._on_artist_clicked(artist_name)
+
+    def _on_sidebar_album_clicked(self, album_data: Dict[str, Any], album_name: str, album_artist: str):
+        if not album_data or not album_data.get("album"):
+            if not album_name:
+                return
+            match = None
+            for a in self.all_albums_cache:
+                if a.get("album", "").strip().lower() == album_name.strip().lower():
+                    if not album_artist or a.get("album_artist", "").strip().lower() == album_artist.strip().lower():
+                        match = a
+                        break
+                    if match is None:
+                        match = a
+            album_data = match
+
+        if not album_data:
+            return
+
+        alb_artist = (album_data.get("display_artist") or album_data.get("album_artist", "")).strip()
+        if self.artist_filter and alb_artist:
+            self.artist_filter = alb_artist
+        elif self.artist_filter and not alb_artist:
+            self.artist_filter = None
+
+        if self.genre_filter:
+            alb_genre = (album_data.get("genre") or "").strip()
+            if alb_genre.lower() != self.genre_filter.lower():
+                self.genre_filter = None
+
+        self._on_album_clicked(album_data)
+
+    def _on_artist_clicked(self, artist_name: str):
+        self.artist_filter = artist_name
+        self.genre_filter = None
+        self.current_view = "albums"
+        self.prev_view = "artists"
+        self.album_page = 0
+        if hasattr(self, "main_stack"):
+            self.main_stack.setCurrentIndex(0)
+        if hasattr(self, "catalog_stack"):
+            self._set_catalog_page("albums")
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.show()
+        self._update_view_buttons_style()
+        self._update_breadcrumb()
+        self.refresh_current_view()
+
+    def _on_artist_image_updated(self, artist_name: str, new_path: str):
+        # Keep the in-memory artist cache in sync. Without this, navigating away
+        # from the Artists view and back re-rendered a stale entry (no image)
+        # until the application was restarted.
+        cache = getattr(self, "all_artists_cache", None)
+        if cache is None:
+            return
+        for artist in cache:
+            if artist.get("name") == artist_name:
+                artist["image_path"] = new_path
+                break
+        if getattr(self, "is_stats_mode", False) and hasattr(self, "statistics_view"):
+            self.statistics_view.refresh_current()
+
+    def _on_genre_clicked(self, genre_name: str):
+        self.genre_filter = genre_name
+        self.artist_filter = None
+        self.current_view = "albums"
+        self.prev_view = "genres"
+        self.album_page = 0
+        if hasattr(self, "main_stack"):
+            self.main_stack.setCurrentIndex(0)
+        if hasattr(self, "catalog_stack"):
+            self._set_catalog_page("albums")
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.show()
+        self._update_view_buttons_style()
+        self._update_breadcrumb()
+        self.refresh_current_view()
+
+    def refresh_library_view(self):
+        # Data changed: drop rendered views and rebuild lazily on next activation.
+        self._data_revision += 1
+        self._invalidate_view_caches()
+        # Reload albums, artists, genres from DB
+        self.all_albums_cache = get_all_albums(self.db_conn)
+        self.all_artists_cache = get_all_artists(self.db_conn)
+        self.all_genres_cache = get_all_genres(self.db_conn)
+        if hasattr(self, "statistics_view"):
+            self.statistics_view.invalidate_cache()
+        if getattr(self, "is_stats_mode", False) and hasattr(self, "statistics_view"):
+            self.statistics_view.refresh_current()
+        self.refresh_current_view()
+        self._update_status_bar_info()
+        # Load artist photos into the RAM thumbnail cache in the background so
+        # the first Artists navigation is already warm.
+        QTimer.singleShot(250, self._prewarm_artist_thumbnails)
+
+    def _prewarm_artist_thumbnails(self):
+        if getattr(self, "_closing", False):
+            return
+        from malka.ui.image_utils import request_async_square_pixmap
+        for artist in getattr(self, "all_artists_cache", []):
+            image_path = artist.get("image_path")
+            if image_path:
+                request_async_square_pixmap(
+                    image_path,
+                    size=170,
+                    radius_top=8,
+                    callback=lambda *_: None,
+                )
+
+    def _library_display_text(self) -> str:
+        paths = list(getattr(config, "library_paths", []))
+        if not paths:
+            return "Not selected"
+        if len(paths) == 1:
+            return paths[0]
+        return f"{paths[0]} (+{len(paths) - 1} more)"
+
+    def _update_status_bar_info(self):
+        total_albums = len(self.all_albums_cache)
+        total_tracks = sum(a.get("track_count", 0) for a in self.all_albums_cache)
+        folders_label = "Folders" if len(getattr(config, "library_paths", [])) > 1 else "Folder"
+        self.status_info_label.setText(
+            f"{folders_label}: {self._library_display_text()}  |  Albums: {total_albums}  |  Tracks: {total_tracks}"
+        )
+
+    def _on_search_text_edited(self, text: str):
+        self.album_page = 0
+        if hasattr(self, "search_timer"):
+            self.search_timer.start()
+
+    def _on_search_text_changed(self, text: str):
+        if not text:
+            self.album_page = 0
+            if hasattr(self, "search_timer"):
+                self.search_timer.stop()
+            self.refresh_current_view()
+        elif hasattr(self, "search_timer") and not self.search_timer.isActive():
+            self.refresh_current_view()
+
+    def _show_sort_menu(self):
+        menu = QMenu(self)
+        menu.setObjectName("sortMenu")
+
+        is_light = getattr(self, "theme", "dark") == "light"
+        if is_light:
+            menu.setStyleSheet("""
+                QMenu#sortMenu {
+                    background-color: #ffffff;
+                    color: #1f2328;
+                    border: 1px solid #d0d7de;
+                    border-radius: 8px;
+                    padding: 6px;
+                }
+                QMenu#sortMenu::item {
+                    padding: 6px 24px 6px 20px;
+                    border-radius: 6px;
+                    font-size: 8.5pt;
+                }
+                QMenu#sortMenu::item:selected {
+                    background-color: #f3f4f6;
+                    color: #0969da;
+                }
+            """)
+        else:
+            menu.setStyleSheet("""
+                QMenu#sortMenu {
+                    background-color: #1a1e24;
+                    color: #e6edf3;
+                    border: 1px solid #30363d;
+                    border-radius: 8px;
+                    padding: 6px;
+                }
+                QMenu#sortMenu::item {
+                    padding: 6px 24px 6px 20px;
+                    border-radius: 6px;
+                    font-size: 8.5pt;
+                }
+                QMenu#sortMenu::item:selected {
+                    background-color: #262c36;
+                    color: #58a6ff;
+                }
+            """)
+
+        # If in Albums view or drilled into an artist or genre (which displays albums)
+        if self.current_view == "albums" or self.artist_filter or self.genre_filter:
+            options = [
+                ("artist_year", "Artist & Year"),
+                ("year_asc", "Year (Ascending)"),
+                ("year_desc", "Year (Descending)"),
+                ("title_asc", "Title (Ascending)"),
+                ("title_desc", "Title (Descending)"),
+            ]
+            active_mode = self.album_sort_mode
+            category = "album"
+        elif self.current_view == "artists":
+            options = [
+                ("name_asc", "Name (Ascending)"),
+                ("name_desc", "Name (Descending)"),
+            ]
+            active_mode = self.artist_sort_mode
+            category = "artist"
+        elif self.current_view == "genres":
+            options = [
+                ("name_asc", "Name (Ascending)"),
+                ("name_desc", "Name (Descending)"),
+            ]
+            active_mode = self.genre_sort_mode
+            category = "genre"
+        else:
+            return
+
+        action_group = QActionGroup(menu)
+        action_group.setExclusive(True)
+
+        for mode_id, label in options:
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            if mode_id == active_mode:
+                action.setChecked(True)
+            action.triggered.connect(lambda checked, m=mode_id, cat=category: self._on_sort_selected(cat, m))
+            action_group.addAction(action)
+            menu.addAction(action)
+
+        btn_rect = self.btn_sort.rect()
+        pos = self.btn_sort.mapToGlobal(btn_rect.bottomLeft())
+        menu.exec(pos)
+
+    def _on_sort_selected(self, category: str, mode_id: str):
+        if category == "album":
+            self.album_sort_mode = mode_id
+            config.album_sort_mode = mode_id
+        elif category == "artist":
+            self.artist_sort_mode = mode_id
+            config.artist_sort_mode = mode_id
+        elif category == "genre":
+            self.genre_sort_mode = mode_id
+            config.genre_sort_mode = mode_id
+        config.save()
+        self.refresh_current_view()
+
+    def refresh_current_view(self):
+        if getattr(self, "_album_build_depth", 0) > 0:
+            # processEvents() during a large grid build may fire the search
+            # debounce timer; defer it until the current render is finished.
+            self._album_refresh_pending = True
+            return
+        if getattr(self, "is_stats_mode", False):
+            if hasattr(self, "statistics_view"):
+                self.statistics_view.refresh_current()
+            return
+
+        query = self.search_edit.text().strip().lower()
+        if self.current_view == "album_detail":
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.hide()
+            if query:
+                self.current_view = "albums"
+                self.artist_filter = None
+                self.genre_filter = None
+                if hasattr(self, "main_stack"):
+                    self.main_stack.setCurrentIndex(0)
+                if hasattr(self, "catalog_stack"):
+                    self._set_catalog_page("albums")
+                self._update_view_buttons_style()
+                if hasattr(self, "btn_sort"):
+                    self.btn_sort.show()
+            else:
+                self._update_breadcrumb()
+                return
+        else:
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.show()
+
+        self._update_breadcrumb()
+
+        if self.current_view == "artists":
+            self._render_artists(query)
+        elif self.current_view == "genres":
+            self._render_genres(query)
+        else:  # "albums"
+            self._render_albums(query)
+
+    # ------------------------------------------------------------------
+    # Rendered-view cache
+    # ------------------------------------------------------------------
+    def _detach_layout_widgets(self):
+        """Removes widgets from the grid layout without deleting them."""
+        while self.flow_layout.count() > 0:
+            item = self.flow_layout.takeAt(0)
+            widget = item.widget() if item else None
+            if widget is not None:
+                widget.hide()
+
+    def _cancel_cover_loading(self):
+        self._cover_queue_token += 1
+        self._cover_queue = []
+        self._cover_queue_index = 0
+        self._cover_queue_active = False
+
+    def _cancel_incremental_album_render(self):
+        state = self._incremental_albums
+        if not state:
+            return
+        self._incremental_albums = None
+        self._album_render_token += 1
+        widgets = set(state.get("widgets", []))
+        for i in range(self.flow_layout.count() - 1, -1, -1):
+            item = self.flow_layout.itemAt(i)
+            widget = item.widget() if item else None
+            if widget in widgets:
+                self.flow_layout.takeAt(i)
+                widget.hide()
+                widget.deleteLater()
+        for widget in state.get("pending", []):
+            widget.hide()
+            widget.deleteLater()
+        self.flow_layout.setEnabled(True)
+        self._cancel_cover_loading()
+
+    def _begin_view_render(self, view_name: str, cache_key: tuple) -> bool:
+        """Reuses a previously rendered view when its data/filter key matches."""
+        self._cancel_incremental_album_render()
+        cache = self._view_caches.get(view_name)
+        if cache and cache.get("key") == cache_key:
+            cached_widgets = cache.get("widgets", [])
+            self._active_empty_label().hide()
+            # Dedicated per-view layouts keep their widgets in place; if the
+            # layout already holds this view's tiles, switching back is O(1).
+            if self.flow_layout.count() != len(cached_widgets):
+                self._detach_layout_widgets()
+                self.flow_layout.setEnabled(False)
+                for widget in cached_widgets:
+                    self.flow_layout.addWidget(widget)
+                self.flow_layout.setEnabled(True)
+                self.flow_layout.invalidate()
+                self._update_container_height()
+            return True
+
+        if view_name == "albums":
+            # Old tiles are about to be replaced; stop feeding them covers.
+            self._cancel_cover_loading()
+        self._detach_layout_widgets()
+        if cache:
+            for widget in cache.get("widgets", []):
+                widget.hide()
+                widget.deleteLater()
+            self._view_caches.pop(view_name, None)
+        return False
+
+    def _store_view_cache(self, view_name: str, cache_key: tuple):
+        widgets = []
+        for i in range(self.flow_layout.count()):
+            item = self.flow_layout.itemAt(i)
+            widget = item.widget() if item else None
+            if widget is not None:
+                widgets.append(widget)
+        if widgets:
+            self._view_caches[view_name] = {"key": cache_key, "widgets": widgets}
+        else:
+            self._view_caches.pop(view_name, None)
+
+    def _invalidate_view_caches(self):
+        self._cancel_incremental_album_render()
+        self._cancel_cover_loading()
+        for layout in (self._albums_flow_layout, self._artists_flow_layout, self._genres_flow_layout):
+            while layout.count() > 0:
+                item = layout.takeAt(0)
+                widget = item.widget() if item else None
+                if widget is not None:
+                    widget.hide()
+                    widget.deleteLater()
+        for cache in list(self._view_caches.values()):
+            for widget in cache.get("widgets", []):
+                widget.hide()
+                widget.deleteLater()
+        self._view_caches.clear()
+
+    def _render_artists(self, filter_text: str = ""):
+        cache_key = (filter_text, self.artist_sort_mode, self._data_revision)
+        self.container_widget.setUpdatesEnabled(False)
+        self.container_widget.hide()
+        if self._begin_view_render("artists", cache_key):
+            self.container_widget.show()
+            self.container_widget.setUpdatesEnabled(True)
+            return
+
+        self.flow_layout.setEnabled(False)
+        try:
+            self.flow_layout.clear()
+            if not self.all_artists_cache:
+                self.all_artists_cache = get_all_artists(self.db_conn)
+            artists = sort_artists(self.all_artists_cache, self.artist_sort_mode)
+
+            filtered = []
+            for art in artists:
+                if not filter_text or filter_text in art["name"].lower():
+                    filtered.append(art)
+
+            if not filtered:
+                if not artists:
+                    self._active_empty_label().setText("No artists found in the library.")
+                else:
+                    self._active_empty_label().setText("No artists found matching the search query.")
+                self._active_empty_label().show()
+                return
+
+            self._active_empty_label().hide()
+
+            for art in filtered:
+                card = ArtistCard(art, self.db_conn)
+                card.artist_clicked.connect(self._on_artist_clicked)
+                card.image_updated.connect(self._on_artist_image_updated)
+                self.flow_layout.addWidget(card)
+
+        finally:
+            # Re-enable layout only after the whole batch has been inserted;
+            # otherwise every addWidget() triggers an O(n) relayout of the grid.
+            self.flow_layout.setEnabled(True)
+            self.flow_layout.invalidate()
+            self._update_container_height()
+            self._store_view_cache("artists", cache_key)
+            self.container_widget.show()
+            self.container_widget.setUpdatesEnabled(True)
+
+    def _render_genres(self, filter_text: str = ""):
+        cache_key = (filter_text, self.genre_sort_mode, self._data_revision)
+        self.container_widget.setUpdatesEnabled(False)
+        self.container_widget.hide()
+        if self._begin_view_render("genres", cache_key):
+            self.container_widget.show()
+            self.container_widget.setUpdatesEnabled(True)
+            return
+
+        self.flow_layout.setEnabled(False)
+        try:
+            self.flow_layout.clear()
+            if not self.all_genres_cache:
+                self.all_genres_cache = get_all_genres(self.db_conn)
+            genres = sort_genres(self.all_genres_cache, self.genre_sort_mode)
+
+            filtered = []
+            for g in genres:
+                if not filter_text or filter_text in g["genre"].lower():
+                    filtered.append(g)
+
+            if not filtered:
+                if not genres:
+                    self._active_empty_label().setText("No genres found in the library.")
+                else:
+                    self._active_empty_label().setText("No genres found matching the search query.")
+                self._active_empty_label().show()
+                return
+
+            self._active_empty_label().hide()
+
+            for g in filtered:
+                card = GenreCard(g)
+                card.genre_clicked.connect(self._on_genre_clicked)
+                self.flow_layout.addWidget(card)
+
+        finally:
+            # Re-enable layout only after the whole batch has been inserted;
+            # otherwise every addWidget() triggers an O(n) relayout of the grid.
+            self.flow_layout.setEnabled(True)
+            self.flow_layout.invalidate()
+            self._update_container_height()
+            self._store_view_cache("genres", cache_key)
+            self.container_widget.show()
+            self.container_widget.setUpdatesEnabled(True)
+
+    def _create_album_card(self, album: Dict[str, Any], defer_cover: bool = False) -> AlbumCard:
+        card = AlbumCard(album, db_conn=self.db_conn, defer_cover=defer_cover)
+        card.album_clicked.connect(self._on_album_clicked)
+        card.edit_requested.connect(self._on_edit_album)
+        card.fix_encoding_requested.connect(self._on_fix_album_encoding)
+        card.organize_requested.connect(self._on_organize_album)
+        card.open_folder_requested.connect(self._on_open_album_folder)
+        return card
+
+    def _build_album_render_items(self, filtered: List[Dict[str, Any]]) -> List[tuple]:
+        """Returns a flat ordered list of ('album', dict) / ('header', title, count)."""
+        items: List[tuple] = []
+        if self.artist_filter:
+            regular_albums = []
+            eps = []
+            singles = []
+            for alb in filtered:
+                cat = categorize_album(alb.get("album", ""))
+                if cat == "ep":
+                    eps.append(alb)
+                elif cat == "single":
+                    singles.append(alb)
+                else:
+                    regular_albums.append(alb)
+
+            regular_albums = sort_albums(regular_albums, self.album_sort_mode)
+            eps = sort_albums(eps, self.album_sort_mode)
+            singles = sort_albums(singles, self.album_sort_mode)
+
+            has_subcategories = bool(eps or singles)
+            if has_subcategories:
+                sections = []
+                if regular_albums:
+                    sections.append(("Albums", regular_albums))
+                if eps:
+                    sections.append(("EPs", eps))
+                if singles:
+                    sections.append(("Singles", singles))
+                for title, albums in sections:
+                    items.append(("header", title, len(albums)))
+                    items.extend(("album", alb) for alb in albums)
+                return items
+        items.extend(("album", alb) for alb in filtered)
+        return items
+
+    @staticmethod
+    def _album_initial(album: Dict[str, Any]) -> str:
+        name = str(album.get("album", "")).strip()
+        if not name:
+            return "#"
+        ch = name[0].upper()
+        return ch if ch.isalnum() else "#"
+
+    def _update_album_pager(self, page_count: int, items: List[tuple]):
+        layout = self._albums_pager_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget() if item else None
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        if page_count <= 1:
+            self._albums_pager_header.hide()
+            return
+
+        if getattr(self, "theme", "dark") == "light":
+            style = (
+                "QPushButton#pagerButton { color:#1f2328; background:#ffffff; border:1px solid #d0d7de;"
+                " border-radius:6px; padding:5px 10px; }"
+                "QPushButton#pagerButton:checked { background:#0969da; color:#ffffff; border-color:#0969da; }"
+            )
+        else:
+            style = (
+                "QPushButton#pagerButton { color:#c9d1d9; background:#21262d; border:1px solid #30363d;"
+                " border-radius:6px; padding:5px 10px; }"
+                "QPushButton#pagerButton:checked { background:#1f6feb; color:#ffffff; border-color:#1f6feb; }"
+            )
+
+        page_chunks = []
+        for page in range(page_count):
+            chunk = items[page * self.album_page_size:(page + 1) * self.album_page_size]
+            albums = [item[1] for item in chunk if item[0] == "album"]
+            if albums:
+                first = self._album_initial(albums[0])
+                last = self._album_initial(albums[-1])
+                page_chunks.append((page, first, last, albums))
+        labels = [first if first == last else f"{first}-{last}" for _, first, last, _ in page_chunks]
+        duplicate_labels = len(set(labels)) < len(labels)
+
+        layout.addStretch(1)
+        for idx, (page, first, last, albums) in enumerate(page_chunks):
+            label = labels[idx]
+            if duplicate_labels:
+                label = f"{label} · {page + 1}"
+            btn = QPushButton(label)
+            btn.setObjectName("pagerButton")
+            btn.setStyleSheet(style)
+            btn.setCheckable(True)
+            btn.setChecked(page == self.album_page)
+            btn.setToolTip(f"{albums[0].get('album', '')} … {albums[-1].get('album', '')}")
+            btn.clicked.connect(lambda _checked=False, p=page: self._goto_album_page(p))
+            layout.addWidget(btn)
+        layout.addStretch(1)
+        self._albums_pager_header.show()
+
+    def _sync_pager_selection(self):
+        buttons = [
+            self._albums_pager_layout.itemAt(i).widget()
+            for i in range(self._albums_pager_layout.count())
+            if self._albums_pager_layout.itemAt(i).widget() is not None
+        ]
+        for page, btn in enumerate(buttons):
+            btn.setChecked(page == self.album_page)
+
+    def _goto_album_page(self, page: int):
+        if page < 0 or page == self.album_page:
+            return
+        self.album_page = page
+        self._albums_scroll_area.verticalScrollBar().setValue(0)
+        self.refresh_current_view()
+
+    def _render_album_item(self, item: tuple, covers_to_load: List[AlbumCard]):
+        if item[0] == "header":
+            header = SectionHeaderWidget(
+                title=item[1],
+                count=item[2],
+                is_first=not covers_to_load,
+                theme=self.theme,
+            )
+            self.flow_layout.addWidget(header)
+            return
+        card = self._create_album_card(item[1], defer_cover=True)
+        covers_to_load.append(card)
+        self.flow_layout.addWidget(card)
+
+    def _begin_incremental_album_render(self, items: List[tuple], cache_key: tuple):
+        """Renders an empty page first, then feeds tiles in event-loop batches."""
+        self._cancel_incremental_album_render()
+        self.flow_layout.setEnabled(False)
+        self._album_render_token += 1
+        token = self._album_render_token
+        self._incremental_albums = {
+            "items": items,
+            "index": 0,
+            "cache_key": cache_key,
+            "token": token,
+            "widgets": [],
+            "album_cards": [],
+            "pending": [],
+            "revision": self._data_revision,
+            "sort_mode": self.album_sort_mode,
+            "filter_text": self.search_edit.text().strip().lower(),
+            "batches_since_paint": 0,
+        }
+        QTimer.singleShot(0, lambda: self._add_incremental_album_batch(token))
+
+    def _add_incremental_album_batch(self, token: int):
+        if getattr(self, "_closing", False):
+            self._cancel_incremental_album_render()
+            return
+        state = self._incremental_albums
+        if not state or state.get("token") != token:
+            return
+        if (
+            self._data_revision != state.get("revision")
+            or self.album_sort_mode != state.get("sort_mode")
+            or self.search_edit.text().strip().lower() != state.get("filter_text")
+        ):
+            self._cancel_incremental_album_render()
+            QTimer.singleShot(0, self.refresh_current_view)
+            return
+
+        items = state["items"]
+        start = state["index"]
+        is_first_batch = (start == 0)
+        batch = items[start:start + 60]
+        if not batch:
+            self._store_view_cache("albums", state["cache_key"])
+            self._incremental_albums = None
+            return
+
+        pending = state.setdefault("pending", [])
+        if is_first_batch:
+            # Paint the very first batch straight away, then keep building the
+            # rest of the widgets *without* parenting them so the visible page
+            # doesn't pay a per-tile show/relayout cost.
+            self.flow_layout.setEnabled(False)
+            self.container_widget.setUpdatesEnabled(False)
+            for item in batch:
+                widget = self._make_album_render_widget(item, state)
+                self.flow_layout.addWidget(widget)
+                widget.show()
+            state["index"] = start + len(batch)
+            self.flow_layout.setEnabled(True)
+            self.flow_layout.invalidate()
+            self._update_container_height()
+            self.container_widget.show()
+            self.container_widget.setUpdatesEnabled(True)
+            QTimer.singleShot(0, lambda: self._add_incremental_album_batch(token))
+            return
+
+        # Subsequent batches: create widgets cheaply, parent them to the layout
+        # in one go at the end.
+        for item in batch:
+            widget = self._make_album_render_widget(item, state)
+            pending.append(widget)
+        state["index"] = start + len(batch)
+
+        if state["index"] >= len(items):
+            self.flow_layout.setEnabled(False)
+            self.container_widget.setUpdatesEnabled(False)
+            for widget in pending:
+                self.flow_layout.addWidget(widget)
+                widget.show()
+            pending.clear()
+            self._update_container_height()
+            self.flow_layout.setEnabled(False)
+            self.container_widget.setUpdatesEnabled(True)
+            self._store_view_cache("albums", state["cache_key"])
+            self._incremental_albums = None
+            self._schedule_visible_covers()
+        else:
+            QTimer.singleShot(0, lambda: self._add_incremental_album_batch(token))
+
+    def _make_album_render_widget(self, item: tuple, state: Dict[str, Any]):
+        if item[0] == "header":
+            widget = SectionHeaderWidget(
+                title=item[1],
+                count=item[2],
+                is_first=(state["index"] == 0),
+                theme=self.theme,
+            )
+        else:
+            widget = self._create_album_card(item[1], defer_cover=True)
+            state["album_cards"].append(widget)
+        # Parent immediately and keep hidden. Creating hundreds of parentless
+        # QWidgets creates top-level native windows and freezes the app.
+        widget.setParent(self.container_widget)
+        widget.hide()
+        state["widgets"].append(widget)
+        return widget
+
+    def _schedule_visible_covers(self):
+        if getattr(self, "_closing", False):
+            return
+        self._cover_scroll_timer.start()
+
+    def _load_visible_covers(self):
+        if getattr(self, "_closing", False):
+            return
+        if self.current_view != "albums" or self._incremental_albums is not None:
+            return
+        if hasattr(self, "main_stack") and self.main_stack.currentIndex() != 0:
+            return
+        scroll = self._albums_scroll_area
+        layout = self._albums_flow_layout
+        if scroll is None or layout is None:
+            return
+        y0 = scroll.verticalScrollBar().value() - 300
+        y1 = y0 + scroll.viewport().height() + 600
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget() if item else None
+            if isinstance(widget, AlbumCard):
+                top = widget.y()
+                if top + widget.height() >= y0 and top <= y1:
+                    widget.load_cover()
+
+    def _start_cover_loading(self, cards: List[AlbumCard]):
+        """Fills already-rendered tiles with artwork, strictly one at a time."""
+        self._cancel_cover_loading()
+        self._cover_queue = list(cards)
+        self._cover_queue_index = 0
+        self._cover_queue_active = True
+        # Loading covers must not invalidate and re-run the 2500-item flow
+        # layout for every single pixmap change.
+        self.flow_layout.setEnabled(False)
+        token = self._cover_queue_token
+        QTimer.singleShot(0, lambda: self._load_next_cover(token))
+
+    def _load_next_cover(self, token: int):
+        if token != self._cover_queue_token or getattr(self, "_closing", False):
+            return
+        if self._cover_queue_index >= len(self._cover_queue):
+            self._cover_queue = []
+            self._cover_queue_index = 0
+            self._cover_queue_active = False
+            self.flow_layout.setEnabled(True)
+            return
+
+        card = self._cover_queue[self._cover_queue_index]
+        self._cover_queue_index += 1
+
+        def _advance():
+            # A zero-delay timer per cover starves every other timer (the UI
+            # looks frozen while 2500 covers are processed). One millisecond
+            # still fills the grid quickly but keeps the event loop responsive.
+            QTimer.singleShot(1, lambda: self._load_next_cover(token))
+
+        try:
+            card.load_cover(callback=_advance)
+        except RuntimeError:
+            # Card was deleted by a refresh between queue steps.
+            _advance()
+
+    def _render_albums(self, filter_text: str = ""):
+        cache_key = (
+            filter_text,
+            self.artist_filter,
+            self.genre_filter,
+            self.album_sort_mode,
+            self._data_revision,
+            self.album_page,
+        )
+        self.container_widget.setUpdatesEnabled(False)
+        if self._begin_view_render("albums", cache_key):
+            self.container_widget.setUpdatesEnabled(True)
+            self._sync_pager_selection()
+            self._schedule_visible_covers()
+            return
+        self.container_widget.hide()
+
+        incremental_started = False
+        covers_to_load: List[AlbumCard] = []
+        self.flow_layout.setEnabled(False)
+        try:
+            self.flow_layout.clear()
+
+            # If filtered by artist or genre
+            if self.artist_filter:
+                album_source = get_albums_by_artist(self.db_conn, self.artist_filter, sort_mode=self.album_sort_mode)
+            elif self.genre_filter:
+                album_source = get_albums_by_genre(self.db_conn, self.genre_filter, sort_mode=self.album_sort_mode)
+            else:
+                album_source = self.all_albums_cache
+
+            filtered = []
+            for alb in album_source:
+                if not filter_text:
+                    filtered.append(alb)
+                    continue
+                name_match = filter_text in alb["album"].lower()
+                artist_match = filter_text in alb["display_artist"].lower()
+                album_artist_match = filter_text in alb["album_artist"].lower()
+                year_match = filter_text in str(alb["year"]).lower()
+                if name_match or artist_match or album_artist_match or year_match:
+                    filtered.append(alb)
+
+            if not filtered:
+                if not album_source:
+                    self.empty_label.setText("No albums found in this category.")
+                else:
+                    self.empty_label.setText("No albums found matching the search query.")
+                self.empty_label.show()
+                return
+
+            self.empty_label.hide()
+            filtered = sort_albums(filtered, self.album_sort_mode)
+
+            # Any large album list (All albums, an artist, a genre, a search
+            # result) opens empty first and fills in background batches.
+            render_items = self._build_album_render_items(filtered)
+            page_count = max(1, (len(render_items) + self.album_page_size - 1) // self.album_page_size)
+            if self.album_page >= page_count:
+                self.album_page = page_count - 1
+            self._update_album_pager(page_count, render_items)
+            if page_count > 1:
+                page_start = self.album_page * self.album_page_size
+                render_items = render_items[page_start:page_start + self.album_page_size]
+
+            if len(render_items) > 120:
+                incremental_started = True
+                self._begin_incremental_album_render(render_items, cache_key)
+                return
+
+            for item in render_items:
+                self._render_album_item(item, covers_to_load)
+
+        finally:
+            # Re-enable layout only after the whole batch has been inserted;
+            # otherwise every addWidget() triggers an O(n) relayout of the grid.
+            if not incremental_started:
+                self.flow_layout.setEnabled(True)
+                self.flow_layout.invalidate()
+                self._update_container_height()
+                self._store_view_cache("albums", cache_key)
+                self.container_widget.show()
+                self.container_widget.setUpdatesEnabled(True)
+                self._schedule_visible_covers()
+            # Incremental mode keeps the page hidden and update-disabled until
+            # the batch build finishes; the grid then appears all at once.
+            if self._album_refresh_pending:
+                self._album_refresh_pending = False
+                QTimer.singleShot(0, self.refresh_current_view)
+
+    def _update_container_height(self):
+        self._resize_catalog_page(self.scroll_area)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            for sa in (
+                getattr(self, "_albums_scroll_area", None),
+                getattr(self, "_artists_scroll_area", None),
+                getattr(self, "_genres_scroll_area", None),
+            ):
+                if sa is not None and obj is sa.viewport():
+                    QTimer.singleShot(0, lambda s=sa: self._resize_catalog_page(s))
+                    break
+        return super().eventFilter(obj, event)
+
+    def _resize_catalog_page(self, scroll: QScrollArea):
+        if getattr(self, "_catalog_resize_guard", False):
+            return
+        container = scroll.widget()
+        layout = container.layout() if container is not None else None
+        if container is None or layout is None:
+            return
+        w = scroll.viewport().width()
+        if w <= 0:
+            return
+        self._catalog_resize_guard = True
+        try:
+            h = layout.heightForWidth(w)
+            container.setFixedSize(w, h)
+            layout.setGeometry(container.rect())
+        finally:
+            self._catalog_resize_guard = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "nav_row_widget"):
+            self.nav_row_widget.update_positions()
+        if hasattr(self, "flow_layout") and hasattr(self, "scroll_area") and hasattr(self, "container_widget"):
+            self._update_container_height()
+
+    def apply_theme(self, theme: str):
+        self.theme = theme
+        config.theme = theme
+        if theme == "light":
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #f6f8fa;
+                }
+                QWidget#centralWidget {
+                    background-color: #f6f8fa;
+                }
+                QWidget#contentWidget {
+                    background-color: #f6f8fa;
+                }
+                QScrollArea {
+                    background-color: #f6f8fa;
+                    border: none;
+                }
+                QWidget#scrollContainer {
+                    background-color: #f6f8fa;
+                }
+                QFrame#albumCard {
+                    background-color: transparent;
+                    border: none;
+                    border-radius: 8px;
+                }
+                QFrame#albumCard:hover {
+                    background-color: rgba(0, 0, 0, 0.06);
+                }
+                QLabel#albumCardTitle {
+                    color: #1f2328;
+                    background: transparent;
+                }
+                QLabel#albumCardInfo {
+                    color: #656d76;
+                    background: transparent;
+                }
+                QStackedWidget {
+                    background-color: #f6f8fa;
+                }
+                QScrollBar:vertical {
+                    background: transparent;
+                    width: 6px;
+                    margin: 0px;
+                    border: none;
+                }
+                QScrollBar::handle:vertical {
+                    background: rgba(0, 0, 0, 0.18);
+                    min-height: 24px;
+                    border-radius: 3px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: rgba(0, 0, 0, 0.32);
+                }
+                QScrollBar::handle:vertical:pressed {
+                    background: rgba(0, 0, 0, 0.45);
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0px;
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                    background: transparent;
+                }
+                QScrollBar:horizontal {
+                    background: transparent;
+                    height: 6px;
+                    margin: 0px;
+                    border: none;
+                }
+                QScrollBar::handle:horizontal {
+                    background: rgba(0, 0, 0, 0.18);
+                    min-width: 24px;
+                    border-radius: 3px;
+                }
+                QScrollBar::handle:horizontal:hover {
+                    background: rgba(0, 0, 0, 0.32);
+                }
+                QScrollBar::handle:horizontal:pressed {
+                    background: rgba(0, 0, 0, 0.45);
+                }
+                QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                    width: 0px;
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                    background: transparent;
+                }
+                QLineEdit#searchEdit {
+                    background-color: #ffffff;
+                    border: 1px solid #d0d7de;
+                    border-radius: 16px;
+                    padding: 6px 14px;
+                    color: #1f2328;
+                    font-size: 9pt;
+                    min-width: 250px;
+                }
+                QLineEdit#searchEdit:hover {
+                    border: 1px solid #b0b8c1;
+                }
+                QLineEdit#searchEdit:focus {
+                    background-color: #ffffff;
+                    border: 1px solid #0969da;
+                }
+                QPushButton.topBtn {
+                    background-color: transparent;
+                    border: none;
+                    border-radius: 8px;
+                    color: #57606a;
+                    padding: 6px 14px;
+                    font-weight: 500;
+                }
+                QPushButton.topBtn:hover {
+                    background-color: rgba(0, 0, 0, 0.06);
+                    border: none;
+                    color: #1f2328;
+                }
+                QPushButton.topBtn:pressed {
+                    background-color: rgba(0, 0, 0, 0.12);
+                    border: none;
+                }
+                QPushButton.topBtn:checked, QPushButton#btnStats:checked {
+                    background-color: #ddf4ff;
+                    color: #0969da;
+                    border: 1px solid #54aeff;
+                    font-weight: bold;
+                }
+                QStatusBar {
+                    background-color: #ffffff;
+                    color: #656d76;
+                    border-top: 1px solid #d0d7de;
+                }
+                QProgressBar {
+                    background-color: #eaeef2;
+                    border: 1px solid #d0d7de;
+                    border-radius: 4px;
+                    text-align: center;
+                    color: #1f2328;
+                    max-height: 14px;
+                    min-width: 180px;
+                }
+                QProgressBar::chunk {
+                    background-color: #0969da;
+                    border-radius: 3px;
+                }
+            """)
+            if hasattr(self, "view_switcher_frame"):
+                self.view_switcher_frame.setStyleSheet("""
+                    QFrame#viewSwitcherFrame {
+                        background-color: #eaeef2;
+                        border: 1px solid #d0d7de;
+                        border-radius: 7px;
+                    }
+                """)
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.setStyleSheet("""
+                    QPushButton#btnSort {
+                        background-color: #eaeef2;
+                        border: 1px solid #d0d7de;
+                        border-radius: 7px;
+                        color: #57606a;
+                        font-size: 8.5pt;
+                        font-weight: 500;
+                        padding: 4px 12px;
+                    }
+                    QPushButton#btnSort:hover {
+                        background-color: #dfe4e9;
+                        border: 1px solid #afb8c1;
+                        color: #1f2328;
+                    }
+                    QPushButton#btnSort:pressed {
+                        background-color: #d0d7de;
+                    }
+                """)
+            if hasattr(self, "status_info_label"):
+                self.status_info_label.setStyleSheet("color: #656d76; margin-left: 8px;")
+            if hasattr(self, "scan_status_label"):
+                self.scan_status_label.setStyleSheet("color: #656d76; margin-right: 8px;")
+            if hasattr(self, "empty_label"):
+                self.empty_label.setStyleSheet("color: #656d76; padding: 40px;")
+        else:
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #0e1116;
+                }
+                QWidget#centralWidget {
+                    background-color: #0e1116;
+                }
+                QWidget#contentWidget {
+                    background-color: #0e1116;
+                }
+                QScrollArea {
+                    background-color: #0e1116;
+                    border: none;
+                }
+                QWidget#scrollContainer {
+                    background-color: #0e1116;
+                }
+                QFrame#albumCard {
+                    background-color: transparent;
+                    border: none;
+                    border-radius: 8px;
+                }
+                QFrame#albumCard:hover {
+                    background-color: rgba(255, 255, 255, 0.08);
+                }
+                QLabel#albumCardTitle {
+                    color: #ffffff;
+                    background: transparent;
+                }
+                QLabel#albumCardInfo {
+                    color: #8b949e;
+                    background: transparent;
+                }
+                QStackedWidget {
+                    background-color: #0e1116;
+                }
+                QScrollBar:vertical {
+                    background: transparent;
+                    width: 6px;
+                    margin: 0px;
+                    border: none;
+                }
+                QScrollBar::handle:vertical {
+                    background: rgba(255, 255, 255, 0.22);
+                    min-height: 24px;
+                    border-radius: 3px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: rgba(255, 255, 255, 0.40);
+                }
+                QScrollBar::handle:vertical:pressed {
+                    background: rgba(255, 255, 255, 0.55);
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0px;
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                    background: transparent;
+                }
+                QScrollBar:horizontal {
+                    background: transparent;
+                    height: 6px;
+                    margin: 0px;
+                    border: none;
+                }
+                QScrollBar::handle:horizontal {
+                    background: rgba(255, 255, 255, 0.22);
+                    min-width: 24px;
+                    border-radius: 3px;
+                }
+                QScrollBar::handle:horizontal:hover {
+                    background: rgba(255, 255, 255, 0.40);
+                }
+                QScrollBar::handle:horizontal:pressed {
+                    background: rgba(255, 255, 255, 0.55);
+                }
+                QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                    width: 0px;
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                    background: transparent;
+                }
+                QLineEdit#searchEdit {
+                    background-color: rgba(255, 255, 255, 0.05);
+                    border: none;
+                    border-radius: 16px;
+                    padding: 6px 14px;
+                    color: #ffffff;
+                    font-size: 9pt;
+                    min-width: 250px;
+                }
+                QLineEdit#searchEdit:hover {
+                    background-color: rgba(255, 255, 255, 0.08);
+                    border: none;
+                }
+                QLineEdit#searchEdit:focus {
+                    background-color: rgba(255, 255, 255, 0.1);
+                    border: none;
+                }
+                QPushButton.topBtn {
+                    background-color: transparent;
+                    border: none;
+                    border-radius: 8px;
+                    color: #c9d1d9;
+                    padding: 6px 14px;
+                    font-weight: 500;
+                }
+                QPushButton.topBtn:hover {
+                    background-color: rgba(255, 255, 255, 0.08);
+                    border: none;
+                    color: #ffffff;
+                }
+                QPushButton.topBtn:pressed {
+                    background-color: rgba(255, 255, 255, 0.14);
+                    border: none;
+                }
+                QPushButton.topBtn:checked, QPushButton#btnStats:checked {
+                    background-color: #1f6feb;
+                    color: #ffffff;
+                    border: 1px solid #388bfd;
+                    font-weight: bold;
+                }
+                QStatusBar {
+                    background-color: #1a1a1a;
+                    color: #888888;
+                    border-top: 1px solid #282828;
+                }
+                QProgressBar {
+                    background-color: #222222;
+                    border: 1px solid #333333;
+                    border-radius: 4px;
+                    text-align: center;
+                    color: #ffffff;
+                    max-height: 14px;
+                    min-width: 180px;
+                }
+                QProgressBar::chunk {
+                    background-color: #007acc;
+                    border-radius: 3px;
+                }
+            """)
+            if hasattr(self, "view_switcher_frame"):
+                self.view_switcher_frame.setStyleSheet("""
+                    QFrame#viewSwitcherFrame {
+                        background-color: #1a1e24;
+                        border: 1px solid #282e38;
+                        border-radius: 7px;
+                    }
+                """)
+            if hasattr(self, "btn_sort"):
+                self.btn_sort.setStyleSheet("""
+                    QPushButton#btnSort {
+                        background-color: #1a1e24;
+                        border: 1px solid #282e38;
+                        border-radius: 7px;
+                        color: #c9d1d9;
+                        font-size: 8.5pt;
+                        font-weight: 500;
+                        padding: 4px 12px;
+                    }
+                    QPushButton#btnSort:hover {
+                        background-color: #242931;
+                        border: 1px solid #3d4450;
+                        color: #ffffff;
+                    }
+                    QPushButton#btnSort:pressed {
+                        background-color: #161a20;
+                    }
+                """)
+            if hasattr(self, "status_info_label"):
+                self.status_info_label.setStyleSheet("color: #aaaaaa; margin-left: 8px;")
+            if hasattr(self, "scan_status_label"):
+                self.scan_status_label.setStyleSheet("color: #888888; margin-right: 8px;")
+            if hasattr(self, "empty_label"):
+                self.empty_label.setStyleSheet("color: #666666; padding: 40px;")
+
+        if hasattr(self, "title_bar"):
+            self.title_bar.apply_theme(theme)
+        if hasattr(self, "player_sidebar"):
+            self.player_sidebar.apply_theme(theme)
+        if hasattr(self, "breadcrumb_bar"):
+            self.breadcrumb_bar.apply_theme(theme)
+        if hasattr(self, "album_detail_view"):
+            self.album_detail_view.apply_theme(theme)
+        if hasattr(self, "statistics_view"):
+            self.statistics_view.apply_theme(theme)
+        if hasattr(self, "btn_view_artists"):
+            self._update_view_buttons_style()
+        if hasattr(self, "flow_layout"):
+            for i in range(self.flow_layout.count()):
+                item = self.flow_layout.itemAt(i)
+                if item and item.widget():
+                    w = item.widget()
+                    if hasattr(w, "apply_theme"):
+                        w.apply_theme(theme)
+        # Cached (currently hidden) views must follow theme changes too.
+        for cache in getattr(self, "_view_caches", {}).values():
+            for widget in cache.get("widgets", []):
+                if hasattr(widget, "apply_theme"):
+                    widget.apply_theme(theme)
+        self.update_scrollbars()
+
+    def _on_edit_album(self, album_name: str, album_artist: str):
+        tracks = get_album_tracks(self.db_conn, album_name, album_artist)
+        file_paths = [t.get("file_path", "") for t in tracks]
+        suspend_state: Dict[str, Any] = {"token": None}
+
+        def on_operation_started():
+            # Pause only when Save is actually pressed, not while browsing the dialog.
+            if suspend_state["token"] is None:
+                suspend_state["token"] = self.player_controller.suspend_for_file_operation(file_paths)
+
+        def on_operation_finished(success: bool):
+            token = suspend_state.pop("token", None)
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+
+        dlg = EditAlbumDialog(album_name, album_artist, self.db_conn, parent=self, theme=self.theme)
+        dlg.operation_about_to_start.connect(on_operation_started)
+        dlg.operation_finished.connect(on_operation_finished)
+        try:
+            if dlg.exec():
+                self.refresh_library_view()
+        finally:
+            token = suspend_state.pop("token", None)
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+
+    def _on_fix_album_encoding(self, album_name: str, album_artist: str):
+        from malka.db import get_album_tracks, upsert_track
+        from malka.tags import detect_and_fix_encoding, read_tags, write_tags
+
+        tracks = get_album_tracks(self.db_conn, album_name, album_artist)
+        if not tracks:
+            return
+
+        token = self.player_controller.suspend_for_file_operation(
+            [t.get("file_path", "") for t in tracks]
+        )
+        fixed_count = 0
+        try:
+            fixed_count = self._fix_album_encoding_files(tracks, detect_and_fix_encoding, read_tags, write_tags, upsert_track)
+        finally:
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+
+        self.db_conn.commit()
+        self.refresh_library_view()
+        QMessageBox.information(
+            self,
+            "Encoding Fixed",
+            f"Successfully fixed tags character encoding for {fixed_count} tracks in '{album_name}'.\n"
+            f"Tags were rewritten in standard UTF-8.",
+        )
+
+    def _fix_album_encoding_files(self, tracks, detect_and_fix_encoding, read_tags, write_tags, upsert_track) -> int:
+        fixed_count = 0
+        for t in tracks:
+            file_p = t.get("file_path")
+            if not file_p or not Path(file_p).exists():
+                continue
+
+            raw_tags = read_tags(file_p)
+
+            title = t.get("title") or raw_tags.get("title")
+            artist = t.get("artist") or raw_tags.get("artist")
+            alb_art = t.get("album_artist") or raw_tags.get("album_artist")
+            album = t.get("album") or raw_tags.get("album")
+            genre = t.get("genre") or raw_tags.get("genre")
+            year = t.get("year") or raw_tags.get("year")
+            track_no = t.get("track_no") or raw_tags.get("track_no")
+            disc_no = t.get("disc_no") or raw_tags.get("disc_no", "1")
+            disc_total = t.get("disc_total") or raw_tags.get("disc_total", "1")
+            compilation = t.get("compilation") or raw_tags.get("compilation", 0)
+
+            # Ensure text is decoded properly if it had mojibake
+            _, title = detect_and_fix_encoding(title)
+            _, artist = detect_and_fix_encoding(artist)
+            _, alb_art = detect_and_fix_encoding(alb_art)
+            _, album = detect_and_fix_encoding(album)
+            _, genre = detect_and_fix_encoding(genre)
+
+            write_tags(
+                file_path=file_p,
+                title=title,
+                artist=artist,
+                album_artist=alb_art,
+                album=album,
+                year=year,
+                genre=genre,
+                track_no=track_no,
+                disc_no=disc_no,
+                disc_total=disc_total,
+                compilation=compilation,
+            )
+
+            updated = dict(t)
+            updated["title"] = title
+            updated["artist"] = artist
+            updated["album_artist"] = alb_art
+            updated["album"] = album
+            updated["genre"] = genre
+            updated["bad_encoding"] = 0
+            upsert_track(self.db_conn, updated)
+            fixed_count += 1
+
+        return fixed_count
+
+    def _on_organize_album(self, album_name: str, album_artist: str):
+        tracks = get_album_tracks(self.db_conn, album_name, album_artist)
+        ready, reason = is_album_ready_to_organize(tracks)
+        if not ready:
+            QMessageBox.warning(self, "Organization Unavailable", reason)
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Organization",
+            f"Organize album '{album_name}'?\n\n"
+            f"Files will be moved to:\n"
+            f"<Library>/{tracks[0]['album_artist']}/{tracks[0]['year']} - {tracks[0]['album']}/\n\n"
+            f"And renamed according to template: {config.track_naming_format}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if confirm == QMessageBox.StandardButton.Yes:
+            album_root = None
+            if tracks:
+                album_root = config.library_root_for_path(tracks[0].get("file_path", ""))
+            album_root = album_root or config.library_path
+            if not album_root or not Path(album_root).exists():
+                QMessageBox.warning(
+                    self,
+                    "Organization Unavailable",
+                    "The library folder that contains this album is not available.",
+                )
+                return
+
+            token = self.player_controller.suspend_for_file_operation(
+                [t.get("file_path", "") for t in tracks]
+            )
+            updated = tracks
+            try:
+                success, msg, updated = organize_album(
+                    album_root,
+                    tracks,
+                    config.track_naming_format,
+                    self.db_conn,
+                )
+            finally:
+                if token:
+                    path_map = {}
+                    for old, new in zip(tracks, updated):
+                        old_path = old.get("file_path", "")
+                        new_path = new.get("file_path", "")
+                        if old_path and new_path:
+                            path_map[old_path] = new_path
+                    self.player_controller.resume_after_file_operation(token, path_map=path_map)
+
+            if success:
+                self.refresh_library_view()
+                QMessageBox.information(self, "Success", msg)
+            else:
+                QMessageBox.critical(self, "Organization Error", msg)
+
+    def _on_open_album_folder(self, album_name: str, album_artist: str):
+        tracks = get_album_tracks(self.db_conn, album_name, album_artist)
+        if not tracks:
+            return
+
+        folder = Path(tracks[0]["file_path"]).parent
+        if not open_folder(str(folder)):
+            QMessageBox.warning(self, "Folder Not Found", f"Folder does not exist:\n{folder}")
+
+    def _on_track_location_requested(self, track: Dict[str, Any]):
+        file_path = (track or {}).get("file_path", "")
+        if not file_path:
+            return
+        if not reveal_file(file_path):
+            QMessageBox.warning(
+                self,
+                "File Not Found",
+                f"Could not open the file location:\n{file_path}",
+            )
+
+    # ------------------ Drag and Drop Support ------------------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                p = Path(url.toLocalFile())
+                if p.is_dir() or p.suffix.lower() in (".cue", ".flac", ".mp3", ".m4a", ".aac", ".m3u", ".wv", ".ape"):
+                    event.acceptProposedAction()
+                    self.status_info_label.setText("Drop album folder here to import...")
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._update_status_bar_info()
+        event.accept()
+
+    def dropEvent(self, event):
+        self._update_status_bar_info()
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.toLocalFile()]
+        if not paths:
+            event.ignore()
+            return
+
+        event.acceptProposedAction()
+        target_folder = paths[0] if paths[0].is_dir() else paths[0].parent
+        self.start_import_workflow(str(target_folder))
+
+    # ------------------ Import Workflow ------------------
+    def _on_click_import(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Album Folder to Import",
+            "",
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if folder:
+            self.start_import_workflow(folder)
+
+    def start_import_workflow(self, folder_path: str):
+        existing_roots = [p for p in config.library_paths if Path(p).exists()]
+        if not existing_roots:
+            QMessageBox.warning(
+                self,
+                "No Library Set",
+                "Please configure your library folder before importing albums.",
+            )
+            self._on_select_directory()
+            existing_roots = [p for p in config.library_paths if Path(p).exists()]
+            if not existing_roots:
+                return
+
+        self.status_info_label.setText(f"Analyzing folder '{Path(folder_path).name}'...")
+        QApplication.processEvents()
+
+        try:
+            analysis = analyze_import_folder(folder_path, self.db_conn)
+        except Exception as e:
+            self._update_status_bar_info()
+            QMessageBox.critical(
+                self,
+                "Import Analysis Error",
+                f"Could not analyze folder for import:\n{e}",
+            )
+            return
+
+        dlg = ImportDialog(analysis, self, theme=self.theme)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            edited_album, edited_tracks = dlg.get_result_data()
+
+            destination = existing_roots[0]
+            if hasattr(dlg, "get_destination_library"):
+                destination = dlg.get_destination_library() or destination
+
+            progress_dlg = ImportProgressDialog(
+                analysis=analysis,
+                edited_album=edited_album,
+                edited_tracks=edited_tracks,
+                library_path=destination,
+                naming_format=config.track_naming_format,
+                db_path=config.db_path,
+                parent=self,
+                theme=self.theme,
+            )
+            progress_dlg.exec()
+
+            if progress_dlg.result_success:
+                # Add/refresh the imported album smoothly without full disk rescan
+                self.refresh_library_view()
+                self.status_info_label.setText(
+                    f"✔ Imported '{edited_album['album']}' ({len(progress_dlg.result_imported)} tracks)"
+                )
+                QMessageBox.information(
+                    self,
+                    "Import Complete",
+                    f"Album '{edited_album['album']}' was successfully imported into your library with {len(progress_dlg.result_imported)} tracks.",
+                )
+            else:
+                self._update_status_bar_info()
+                msg = progress_dlg.result_msg or "Import was cancelled or failed."
+                if "cancelled" in msg.lower():
+                    self.status_info_label.setText("⚠ Import cancelled.")
+                else:
+                    QMessageBox.critical(self, "Import Failed", f"Failed to import album:\n{msg}")
+        else:
+            self._update_status_bar_info()
+
+    # ------------------ Frameless Window Resizing & State ------------------
+    def _get_resize_edge(self, pos: QPoint):
+        if self.isMaximized():
+            return None
+        m = 6
+        edge = None
+        if pos.x() <= m:
+            edge = Qt.Edge.LeftEdge if edge is None else (edge | Qt.Edge.LeftEdge)
+        elif pos.x() >= self.width() - m:
+            edge = Qt.Edge.RightEdge if edge is None else (edge | Qt.Edge.RightEdge)
+        if pos.y() <= m:
+            edge = Qt.Edge.TopEdge if edge is None else (edge | Qt.Edge.TopEdge)
+        elif pos.y() >= self.height() - m:
+            edge = Qt.Edge.BottomEdge if edge is None else (edge | Qt.Edge.BottomEdge)
+        return edge
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            edge = self._get_resize_edge(event.pos())
+            if edge and self.windowHandle():
+                self.windowHandle().startSystemResize(edge)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        edge = self._get_resize_edge(event.pos())
+        if edge == Qt.Edge.LeftEdge or edge == Qt.Edge.RightEdge:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif edge == Qt.Edge.TopEdge or edge == Qt.Edge.BottomEdge:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif edge == (Qt.Edge.TopEdge | Qt.Edge.LeftEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.RightEdge):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif edge == (Qt.Edge.TopEdge | Qt.Edge.RightEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.LeftEdge):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if hasattr(self, "title_bar") and self.title_bar:
+            self.title_bar.update_max_restore_button(self.isMaximized())
+
+    def closeEvent(self, event):
+        self._closing = True
+        self._cancel_cover_loading()
+        try:
+            from malka.ui.image_utils import clear_thumbnail_queue
+            clear_thumbnail_queue()
+        except Exception:
+            pass
+        if hasattr(self, "player_controller"):
+            try:
+                config.volume = self.player_controller.get_volume()
+                state = self.player_controller.get_playback_state()
+                if state:
+                    config.playback_state = state
+                    config.save_runtime_state()
+                else:
+                    config.save_volume()
+            except Exception:
+                pass
+            self.player_controller.stop()
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            self.scanner_thread.cancel()
+            self.scanner_thread.wait(2000)
+        self.db_conn.close()
+        super().closeEvent(event)

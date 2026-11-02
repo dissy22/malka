@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Build artifacts / releases
+build/
+dist/
+release/
+*.exe
+*.msi
+*.spec.bak
+
+# Application data and local settings
+.malka/
+*.log
+
+# Generated / test music libraries and staging folders
+test_music_library/
+test_music_library2/
+files_to_import/
+The Beatles (White Album)/
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.aiff
+*.ape
+*.wv
+*.cue
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Keep bundled application artwork/icons
+!resources/*.png
+!resources/*.gif
+!resources/*.ico
+!resources/*.jpg
+!resources/*.jpeg
+
+# Third-party binaries (ffmpeg / flac / qaac)
+codecs/
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
