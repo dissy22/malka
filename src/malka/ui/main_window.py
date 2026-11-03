@@ -80,7 +80,7 @@ from malka.ui.edit_dialog import EditAlbumDialog, EditTrackDialog
 from malka.ui.file_utils import move_to_recycle_bin, open_folder, reveal_file
 from malka.ui.flow_layout import FlowLayout
 from malka.ui.genre_card import GenreCard
-from malka.ui.image_utils import emoji_icon, get_resource_path, get_tinted_icon
+from malka.ui.image_utils import app_icon, get_resource_path, get_tinted_icon
 from malka.ui.import_dialog import ImportDialog
 from malka.ui.import_progress_dialog import ImportProgressDialog
 from malka.ui.library_dialogs import RescanLibrariesDialog
@@ -330,7 +330,7 @@ class MainWindow(QMainWindow):
     def __init__(self, check_first_launch: bool = True):
         super().__init__()
         self.setWindowTitle("Malka — Music Library Organizer")
-        self.setWindowIcon(emoji_icon("🎵"))
+        self.setWindowIcon(app_icon())
         self.resize(1050, 750)
         self.setMinimumSize(800, 550)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)

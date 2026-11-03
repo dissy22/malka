@@ -141,6 +141,24 @@ def get_resource_path(filename: str) -> str:
     return ""
 
 
+_APP_ICON_CACHE: Optional[QIcon] = None
+
+
+def app_icon() -> QIcon:
+    """The branded Malka icon used by the window, taskbar and About dialog."""
+    global _APP_ICON_CACHE
+    if _APP_ICON_CACHE is not None:
+        return _APP_ICON_CACHE
+    path = get_resource_path("malka.ico")
+    if path:
+        icon = QIcon(path)
+        if not icon.isNull():
+            _APP_ICON_CACHE = icon
+            return icon
+    _APP_ICON_CACHE = emoji_icon("🎵")
+    return _APP_ICON_CACHE
+
+
 def checkbox_checkmark_qss() -> str:
     """Shared QSS fragment that puts a real checkmark inside checked boxes."""
     path = get_resource_path("checkmark.png").replace("\\", "/")

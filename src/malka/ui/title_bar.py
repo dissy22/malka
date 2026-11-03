@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from malka.config import config
+from malka.ui.image_utils import app_icon
 
 
 class CustomTitleBar(QWidget):
@@ -32,8 +33,13 @@ class CustomTitleBar(QWidget):
         layout.setSpacing(6)
 
         # App Icon & Title
-        self.icon_label = QLabel("🎵")
-        self.icon_label.setStyleSheet("font-size: 11pt; background: transparent;")
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(20, 20)
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.icon_label.setStyleSheet("background: transparent;")
+        brand = app_icon().pixmap(18, 18)
+        if not brand.isNull():
+            self.icon_label.setPixmap(brand)
         layout.addWidget(self.icon_label)
 
         self.title_label = QLabel("Malka")

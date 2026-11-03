@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from malka.config import config
-from malka.ui.image_utils import emoji_icon, get_resource_path
+from malka.ui.image_utils import app_icon, get_resource_path
 
 APP_VERSION = "1.0"
 SUPPORT_URL = "https://boosty.to/paveldistrianov/donate"
@@ -30,7 +30,7 @@ class AboutDialog(QDialog):
         self.setWindowTitle(f"About Malka {APP_VERSION}")
         self.setModal(True)
         self.setFixedSize(760, 620)
-        self.setWindowIcon(emoji_icon("🎵"))
+        self.setWindowIcon(app_icon())
 
         if theme is not None:
             self.theme = theme
@@ -95,10 +95,13 @@ class AboutDialog(QDialog):
         header = QHBoxLayout()
         header.setSpacing(16)
 
-        self.icon_label = QLabel("🎵")
-        self.icon_label.setObjectName("aboutEmoji")
+        self.icon_label = QLabel()
+        self.icon_label.setObjectName("aboutAppIcon")
         self.icon_label.setFixedSize(84, 84)
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand = app_icon().pixmap(72, 72)
+        if not brand.isNull():
+            self.icon_label.setPixmap(brand)
         header.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignTop)
 
         title_block = QVBoxLayout()
@@ -231,9 +234,7 @@ class AboutDialog(QDialog):
         self.setStyleSheet(f"""
             QDialog {{ background-color: {bg}; }}
             QLabel {{ color: {text_color}; font-size: 12px; }}
-            QLabel#aboutEmoji {{
-                font-family: "Segoe UI Emoji";
-                font-size: 34pt;
+            QLabel#aboutAppIcon {{
                 background: transparent;
             }}
             QLabel#aboutTitle {{
