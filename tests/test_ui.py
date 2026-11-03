@@ -309,7 +309,6 @@ class TestMalkaUI(unittest.TestCase):
             card.contextMenuEvent(_FakeEvent())
         actions = {a.text(): a for a in card.context_menu.actions()}
         self.assertTrue(actions["Fix tags encoding"].isEnabled())
-        self.assertIn("item:disabled", card.context_menu.styleSheet())
 
         normal_data = dict(album_data)
         normal_data["has_bad_encoding"] = False

@@ -59,6 +59,7 @@ class Config:
         self.album_sort_mode: str = "artist_year"
         self.artist_sort_mode: str = "name_asc"
         self.genre_sort_mode: str = "name_asc"
+        self.view_mode: str = "tiles"
         self.volume: int = 100
         self.playback_state: Optional[Dict[str, Any]] = None
         # Remembered import quality settings per source kind (see malka.formats).
@@ -206,6 +207,7 @@ class Config:
                     self.album_sort_mode = data.get("album_sort_mode", "artist_year")
                     self.artist_sort_mode = data.get("artist_sort_mode", "name_asc")
                     self.genre_sort_mode = data.get("genre_sort_mode", "name_asc")
+                    self.view_mode = data.get("view_mode", "tiles") if data.get("view_mode") in ("tiles", "table") else "tiles"
                     try:
                         self.volume = max(0, min(100, int(data.get("volume", 100))))
                     except Exception:
@@ -277,6 +279,7 @@ class Config:
             "album_sort_mode": self.album_sort_mode,
             "artist_sort_mode": self.artist_sort_mode,
             "genre_sort_mode": self.genre_sort_mode,
+            "view_mode": self.view_mode,
             "volume": self.volume,
             "playback_state": self.playback_state,
             "import_settings": {k: dict(v) for k, v in self.import_settings.items()},

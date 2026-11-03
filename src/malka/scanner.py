@@ -31,6 +31,7 @@ class LibraryScanner(QThread):
         db_path: str,
         force_rescan: bool = False,
         naming_format: Optional[str] = None,
+        delete_scope: Optional[Iterable[str]] = None,
     ):
         super().__init__()
         if isinstance(library_path, (str, Path)):
@@ -41,6 +42,7 @@ class LibraryScanner(QThread):
         self.library_path = paths[0] if paths else ""
         self.db_path = db_path
         self.force_rescan = force_rescan
+        self.delete_scope: List[str] = [str(p) for p in delete_scope] if delete_scope else list(paths)
         self.naming_format = naming_format
         self._is_cancelled = False
 
@@ -85,8 +87,6 @@ class LibraryScanner(QThread):
         total_files = len(audio_files)
         if total_files == 0:
             self.status_text.emit("No audio files found")
-            self.finished_scan.emit(0, 0)
-            return
 
         conn = get_connection(self.db_path)
         try:
@@ -124,22 +124,24 @@ class LibraryScanner(QThread):
 
             conn.commit()
 
-            # Smart compilation check: if an album has multiple distinct artists and missing/default album_artist
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT album FROM tracks
-                WHERE album_artist = ? OR album_artist = artist
-                GROUP BY album
-                HAVING COUNT(DISTINCT artist) > 1 AND album != ?
-            """, (NO_DATA, NO_DATA))
-            for row in cursor.fetchall():
-                comp_album = row["album"]
+            # Smart compilation check only on a full scan; a partial scan must
+            # not rewrite metadata belonging to other library folders.
+            if len(self.delete_scope) >= len(getattr(config, "library_paths", [])):
+                cursor = conn.cursor()
                 cursor.execute("""
-                    UPDATE tracks
-                    SET album_artist = 'Various Artists', compilation = 1
-                    WHERE album = ? AND (album_artist = ? OR album_artist = artist)
-                """, (comp_album, NO_DATA))
-            conn.commit()
+                    SELECT album FROM tracks
+                    WHERE album_artist = ? OR album_artist = artist
+                    GROUP BY album
+                    HAVING COUNT(DISTINCT artist) > 1 AND album != ?
+                """, (NO_DATA, NO_DATA))
+                for row in cursor.fetchall():
+                    comp_album = row["album"]
+                    cursor.execute("""
+                        UPDATE tracks
+                        SET album_artist = 'Various Artists', compilation = 1
+                        WHERE album = ? AND (album_artist = ? OR album_artist = artist)
+                    """, (comp_album, NO_DATA))
+                conn.commit()
 
             # Never drop tracks that live under a configured library root which is
             # currently unavailable (unplugged drive, network share, ...).
@@ -157,14 +159,17 @@ class LibraryScanner(QThread):
                             continue
 
             self.status_text.emit("Synchronizing deleted files...")
-            deleted_count = delete_missing_tracks(conn, scanned_paths)
+            deleted_count = delete_missing_tracks(conn, scanned_paths, roots=self.delete_scope)
 
             # Recompute the "files need to be organized" flag for the library layout.
             template = self.naming_format or getattr(config, "track_naming_format", "<track_no>. <title>")
             try:
                 # Use every configured root (not just currently mounted ones) so
                 # tracks on an unplugged drive keep their "organized" state.
-                refresh_organization_flags(conn, list(self.library_paths), template)
+                flag_roots = list(dict.fromkeys(
+                    list(self.library_paths) + list(getattr(config, "library_paths", []))
+                ))
+                refresh_organization_flags(conn, flag_roots, template)
             except Exception as exc:
                 print(f"Failed to refresh organization flags: {exc}")
 

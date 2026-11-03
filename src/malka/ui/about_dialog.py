@@ -109,7 +109,7 @@ class AboutDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.setSpacing(10)
 
-        self.btn_support = QPushButton("Поддержать проект")
+        self.btn_support = QPushButton("Support the project")
         self.btn_support.setObjectName("supportBtn")
         self.btn_support.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_support.setToolTip(SUPPORT_URL)

@@ -9,10 +9,12 @@ from PyQt6.QtWidgets import QFileDialog, QFrame, QLabel, QMenu, QVBoxLayout
 
 from malka.config import ARTISTS_CACHE_DIR, NO_DATA
 from malka.db import set_artist_image
+from malka.ui.menu_utils import context_menu_qss
 from malka.ui.image_utils import (
     ARTIST_IMAGE_SIZE,
     create_square_placeholder,
     get_cached_square_pixmap,
+    get_tinted_icon,
     invalidate_image_cache,
     request_async_square_pixmap,
     save_square_artist_image,
@@ -225,23 +227,10 @@ class ArtistCard(QFrame):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #21262d;
-                color: #ffffff;
-                border: 1px solid #444c56;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 20px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #30363d;
-            }
-        """)
+        menu.setStyleSheet(context_menu_qss(self.theme))
 
         image_action = QAction(
+            get_tinted_icon("context_menu_edit_tags.png", 20, self.theme),
             "Change artist image" if self._has_image() else "Add artist image",
             self,
         )
@@ -249,7 +238,10 @@ class ArtistCard(QFrame):
         menu.addAction(image_action)
 
         if self._has_image():
-            remove_action = QAction("Remove artist image", self)
+            remove_action = QAction(
+                get_tinted_icon("context_menu_delete.png", 20, self.theme),
+                "Remove artist image", self,
+            )
             remove_action.triggered.connect(self._remove_artist_image)
             menu.addAction(remove_action)
 

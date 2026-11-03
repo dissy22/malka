@@ -26,6 +26,7 @@ from malka.config import NO_DATA, config
 from malka.db import get_album_tracks, update_track
 from malka.organizer import is_album_ready_to_organize
 from malka.tags import write_tags
+from malka.ui.image_utils import checkbox_checkmark_qss
 
 COMMON_DARK_STYLESHEET = """
     QDialog {
@@ -449,6 +450,7 @@ class BaseAlbumEditDialog(QDialog):
         self.theme = theme
         is_light = (theme == "light")
         self.setStyleSheet(COMMON_LIGHT_STYLESHEET if is_light else COMMON_DARK_STYLESHEET)
+        self.setStyleSheet(self.styleSheet() + checkbox_checkmark_qss())
 
         if hasattr(self, "album_cover_widget"):
             self.album_cover_widget.apply_theme(theme)
@@ -1061,5 +1063,84 @@ class EditAlbumDialog(BaseAlbumEditDialog):
         finally:
             self.operation_finished.emit(success)
 
+        if success:
+            self.accept()
+
+
+class EditTrackDialog(BaseAlbumEditDialog):
+    """Edit tags of one specific track (single-track tab only)."""
+
+    operation_about_to_start = pyqtSignal()
+    operation_finished = pyqtSignal(bool)
+
+    def __init__(self, track: Dict[str, Any], db_conn, parent=None, theme: Optional[str] = None):
+        self.db_conn = db_conn
+        self.track = dict(track)
+        super().__init__(tracks=[dict(track)], parent=parent, theme=theme)
+        title = self.track.get("title", "Track")
+        self.setWindowTitle(f"Edit Track Tags: {title}")
+        self.tabs.setCurrentIndex(1)
+        self.tabs.setTabEnabled(0, False)
+        self.btn_action.setText("Save Changes")
+        self.btn_action.clicked.connect(self._on_save)
+
+    def _on_save(self):
+        self._save_current_single_track_form()
+        fix_enc = self.fix_encoding_checkbox.isChecked()
+        success = False
+        self.operation_about_to_start.emit()
+        try:
+            t = self.tracks[0]
+            file_path = t["file_path"]
+            if fix_enc:
+                from malka.tags import detect_and_fix_encoding
+                for k in ("title", "artist", "album_artist", "album", "genre"):
+                    v = t.get(k)
+                    if v and v != NO_DATA:
+                        _, fixed_val = detect_and_fix_encoding(str(v))
+                        t[k] = fixed_val
+
+            updated_tags = write_tags(
+                file_path=file_path,
+                title=t.get("title"),
+                artist=t.get("artist"),
+                album_artist=t.get("album_artist"),
+                album=t.get("album"),
+                year=t.get("year"),
+                genre=t.get("genre"),
+                track_no=t.get("track_no"),
+                disc_no=t.get("disc_no"),
+                disc_total=t.get("disc_total"),
+                compilation=t.get("compilation"),
+                new_cover_path=None,
+                remove_cover=False,
+            )
+            from malka.organizer import is_track_organized
+            db_data = {
+                "title": updated_tags["title"],
+                "artist": updated_tags["artist"],
+                "album_artist": updated_tags["album_artist"],
+                "album": updated_tags["album"],
+                "year": updated_tags["year"],
+                "genre": updated_tags["genre"],
+                "track_no": updated_tags["track_no"],
+                "disc_no": updated_tags.get("disc_no", "1"),
+                "disc_total": updated_tags.get("disc_total", "1"),
+                "compilation": updated_tags.get("compilation", 0),
+                "has_cover": updated_tags["has_cover"],
+                "cover_cache_path": updated_tags["cover_cache_path"],
+                "mtime": updated_tags["mtime"],
+                "bad_encoding": 0 if fix_enc else int(t.get("bad_encoding", 0)),
+                "is_organized": 1 if is_track_organized(
+                    updated_tags, list(config.library_paths), config.track_naming_format, self.is_multi_disc
+                ) else 0,
+            }
+            update_track(self.db_conn, t["id"], db_data)
+            self.db_conn.commit()
+            success = True
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save track tags: {e}")
+        finally:
+            self.operation_finished.emit(success)
         if success:
             self.accept()

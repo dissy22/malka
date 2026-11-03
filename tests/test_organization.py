@@ -238,8 +238,11 @@ class TestOrganizeDialog(unittest.TestCase):
         self.assertEqual(dlg.left_table.rowCount(), 1)
         self.assertEqual(dlg.right_table.rowCount(), 1)
         # Only the part after the shared prefix is shown...
-        self.assertEqual(dlg.left_table.item(0, 0).text(), "Random/x.flac")
-        self.assertEqual(dlg.right_table.item(0, 0).text(), "Artist/2020 - Album/01. Song.flac")
+        self.assertEqual(dlg.left_table.item(0, 0).text(), os.path.join("Random", "x.flac"))
+        self.assertEqual(
+            dlg.right_table.item(0, 0).text(),
+            os.path.join("Artist", "2020 - Album", "01. Song.flac"),
+        )
         # ...while tooltips keep the absolute paths.
         self.assertEqual(dlg.left_table.item(0, 0).toolTip(), str(self.root1 / "Random" / "x.flac"))
         self.assertIn(str(self.root1), dlg.right_table.item(0, 0).toolTip())
@@ -279,7 +282,7 @@ class TestOrganizeDialog(unittest.TestCase):
         # Checked (default): only the differing part of changed rows.
         self.assertTrue(dlg.show_diff_cb.isChecked())
         self.assertEqual(dlg.left_table.rowCount(), 1)
-        self.assertEqual(dlg.left_table.item(0, 0).text(), "Random/x.flac")
+        self.assertEqual(dlg.left_table.item(0, 0).text(), os.path.join("Random", "x.flac"))
 
         # Unchecked: full paths for every track, including unchanged ones.
         dlg.show_diff_cb.setChecked(False)

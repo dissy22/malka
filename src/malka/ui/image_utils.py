@@ -118,7 +118,7 @@ def save_square_artist_image(source_path: Union[str, Path], dest_path: Union[str
         return False
 
 
-_TINTED_ICON_CACHE: Dict[Tuple[str, int, str], QIcon] = {}
+_TINTED_ICON_CACHE: Dict[Tuple[str, int, str, Optional[Tuple[int, int, int]]], QIcon] = {}
 _EMOJI_ICON_CACHE: Dict[str, QIcon] = {}
 
 
@@ -133,18 +133,39 @@ def _resource_candidates(filename: str) -> List[Path]:
     return candidates
 
 
-def get_tinted_icon(filename: str, size: int = 18, theme: str = "dark") -> QIcon:
-    """Loads a black glyph and recolours it for the current theme.
+def get_resource_path(filename: str) -> str:
+    """Returns the first existing resource path, or an empty string."""
+    for path in _resource_candidates(filename):
+        if path.exists():
+            return str(path)
+    return ""
 
-    Dark theme -> light glyph (inverted), light theme -> dark glyph.
-    Multiple DPR variants are embedded so the icon stays razor sharp.
-    """
-    key = (filename, size, theme)
+
+def checkbox_checkmark_qss() -> str:
+    """Shared QSS fragment that puts a real checkmark inside checked boxes."""
+    path = get_resource_path("checkmark.png").replace("\\", "/")
+    if not path:
+        return ""
+    return (
+        f'QCheckBox::indicator:checked {{ image: url("{path}");'
+        ' image-position: center; }'
+    )
+
+
+def get_tinted_icon(
+    filename: str,
+    size: int = 18,
+    theme: str = "dark",
+    color: Optional[Tuple[int, int, int]] = None,
+) -> QIcon:
+    """Loads an alpha glyph and recolours it for the current theme/state."""
+    key = (filename, size, theme, color)
     if key in _TINTED_ICON_CACHE:
         return _TINTED_ICON_CACHE[key]
 
     # Match the "NOW PLAYING" caption: muted grey, not stark black/white.
-    color = (139, 148, 158) if theme != "light" else (101, 109, 118)
+    if color is None:
+        color = (139, 148, 158) if theme != "light" else (101, 109, 118)
     icon = QIcon()
     for path in _resource_candidates(filename):
         if not path.exists():
@@ -162,7 +183,18 @@ def get_tinted_icon(filename: str, size: int = 18, theme: str = "dark") -> QIcon
                     qimg = QImage(data, target, target, QImage.Format.Format_RGBA8888)
                     pix = QPixmap.fromImage(qimg)
                     pix.setDevicePixelRatio(dpr)
-                    icon.addPixmap(pix)
+                    icon.addPixmap(pix, QIcon.Mode.Normal)
+
+                    disabled_alpha = resized_alpha.point(lambda a: int(a * 0.38))
+                    disabled_img = Image.new("RGBA", resized.size, color + (255,))
+                    disabled_img.putalpha(disabled_alpha)
+                    disabled_data = disabled_img.tobytes("raw", "RGBA")
+                    disabled_qimg = QImage(
+                        disabled_data, target, target, QImage.Format.Format_RGBA8888
+                    )
+                    disabled_pix = QPixmap.fromImage(disabled_qimg)
+                    disabled_pix.setDevicePixelRatio(dpr)
+                    icon.addPixmap(disabled_pix, QIcon.Mode.Disabled)
         except Exception:
             icon = QIcon()
             continue

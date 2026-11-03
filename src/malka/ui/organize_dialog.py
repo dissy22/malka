@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from malka.config import config
 from malka.organizer import build_organization_plan
+from malka.ui.image_utils import checkbox_checkmark_qss
 
 
 class OrganizeDialog(QDialog):
@@ -286,6 +287,7 @@ class OrganizeDialog(QDialog):
                 }
                 QPushButton#organizeApply:hover { background-color: #2ea043; }
             """)
+        self.setStyleSheet(self.styleSheet() + checkbox_checkmark_qss())
 
     # ------------------------------------------------------------------
     # Plan

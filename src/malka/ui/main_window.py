@@ -3,13 +3,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QPoint, QSize, Qt, QTimer
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -20,6 +32,8 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QStackedWidget,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -29,6 +43,8 @@ from malka.config import NO_DATA, config
 from malka.db import (
     album_sort_key,
     categorize_album,
+    delete_tracks_by_paths,
+    delete_tracks_under_root,
     get_album_tracks,
     get_albums_by_artist,
     get_albums_by_genre,
@@ -37,6 +53,7 @@ from malka.db import (
     get_all_genres,
     get_connection,
     init_db,
+    parse_year_int,
     set_artist_image,
     sort_albums,
     sort_artists,
@@ -59,13 +76,14 @@ from malka.ui.audio_info import request_audio_info
 from malka.ui.album_detail_view import AlbumDetailView
 from malka.ui.artist_card import ArtistCard
 from malka.ui.breadcrumb_bar import BreadcrumbBar
-from malka.ui.edit_dialog import EditAlbumDialog
-from malka.ui.file_utils import open_folder, reveal_file
+from malka.ui.edit_dialog import EditAlbumDialog, EditTrackDialog
+from malka.ui.file_utils import move_to_recycle_bin, open_folder, reveal_file
 from malka.ui.flow_layout import FlowLayout
 from malka.ui.genre_card import GenreCard
-from malka.ui.image_utils import emoji_icon, get_tinted_icon
+from malka.ui.image_utils import emoji_icon, get_resource_path, get_tinted_icon
 from malka.ui.import_dialog import ImportDialog
 from malka.ui.import_progress_dialog import ImportProgressDialog
+from malka.ui.library_dialogs import RescanLibrariesDialog
 from malka.ui.player_sidebar import PlayerSidebar
 from malka.ui.section_header import SectionHeaderWidget
 from malka.ui.organize_dialog import OrganizeDialog
@@ -107,6 +125,82 @@ def format_page_label(first: str, last: str) -> str:
     return first if first == last else f"{first}-{last}"
 
 
+class SegmentButton(QPushButton):
+    """A flat segment whose rounded fill is painted edge-to-edge inside an island."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._segment_fill = QColor(0, 0, 0, 0)
+        self._segment_hover = QColor(0, 0, 0, 0)
+        self._segment_radius = "none"
+        self._segment_divider = QColor(0, 0, 0, 0)
+        self._segment_divider_visible = False
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_segment_style(self, fill: str, hover: str, radius: str, divider: str, show_divider: bool):
+        def _color(value: str) -> QColor:
+            color = QColor(value)
+            return color if color.isValid() else QColor(0, 0, 0, 0)
+
+        self._segment_fill = _color(fill)
+        self._segment_hover = _color(hover)
+        self._segment_radius = radius
+        self._segment_divider = _color(divider)
+        self._segment_divider_visible = show_divider
+        self.update()
+
+    def _shape_path(self) -> QPainterPath:
+        w, h = self.width(), self.height()
+        r = 7.0
+        left = self._segment_radius in ("left", "both")
+        right = self._segment_radius in ("right", "both")
+        path = QPainterPath()
+        path.moveTo(r if left else 0, 0)
+        path.lineTo(w - r if right else w, 0)
+        if right:
+            path.quadTo(w, 0, w, r)
+            path.lineTo(w, h - r)
+            path.quadTo(w, h, w - r, h)
+        else:
+            path.lineTo(w, h)
+        path.lineTo(r if left else 0, h)
+        if left:
+            path.quadTo(0, h, 0, h - r)
+            path.lineTo(0, r)
+            path.quadTo(0, 0, r, 0)
+        else:
+            path.lineTo(0, 0)
+        path.closeSubpath()
+        return path
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path = self._shape_path()
+        painter.setClipPath(path)
+        fill = self._segment_hover if self.underMouse() and self.isEnabled() else self._segment_fill
+        if fill.alpha() > 0:
+            painter.fillPath(path, fill)
+        if self._segment_divider_visible:
+            painter.setPen(self._segment_divider)
+            painter.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+        painter.end()
+        super().paintEvent(event)
+
+
+def _rounded_rect_mask(width: int, height: int, radius: int):
+    """Raster mask used to clip segmented islands to their rounded corners."""
+    pix = QPixmap(width, height)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawRoundedRect(0, 0, width, height, radius, radius)
+    painter.end()
+    return pix.mask()
+
+
 class NavRowWidget(QWidget):
     """
     Navigation row widget that keeps the View Switcher (Artists | Albums | Genres)
@@ -119,6 +213,7 @@ class NavRowWidget(QWidget):
         super().__init__(parent)
         self.breadcrumb_bar: Optional[QWidget] = None
         self.view_switcher_frame: Optional[QWidget] = None
+        self.mode_island: Optional[QWidget] = None
         self.sort_button: Optional[QWidget] = None
         self.setFixedHeight(36)
 
@@ -127,10 +222,12 @@ class NavRowWidget(QWidget):
         breadcrumb_bar: QWidget,
         view_switcher_frame: QWidget,
         sort_button: Optional[QWidget] = None,
+        mode_island: Optional[QWidget] = None,
     ):
         self.breadcrumb_bar = breadcrumb_bar
         self.view_switcher_frame = view_switcher_frame
         self.sort_button = sort_button
+        self.mode_island = mode_island
 
         self.breadcrumb_bar.setParent(self)
         self.view_switcher_frame.setParent(self)
@@ -139,11 +236,14 @@ class NavRowWidget(QWidget):
         if self.sort_button:
             self.sort_button.setParent(self)
             self.sort_button.installEventFilter(self)
+        if self.mode_island:
+            self.mode_island.setParent(self)
+            self.mode_island.installEventFilter(self)
 
         self.update_positions()
 
     def eventFilter(self, obj, event):
-        if obj in (self.breadcrumb_bar, self.sort_button) and event.type() in (QEvent.Type.Show, QEvent.Type.Hide):
+        if obj in (self.breadcrumb_bar, self.sort_button, self.mode_island) and event.type() in (QEvent.Type.Show, QEvent.Type.Hide):
             self.update_positions()
         return super().eventFilter(obj, event)
 
@@ -157,8 +257,7 @@ class NavRowWidget(QWidget):
         if not self.view_switcher_frame:
             return
 
-        sw_size = self.view_switcher_frame.sizeHint()
-        sw_w = max(sw_size.width(), 260)
+        sw_w = 252
         sw_h = 32
         cx = (w - sw_w) // 2
         cy = (h - sw_h) // 2
@@ -168,11 +267,19 @@ class NavRowWidget(QWidget):
             max_bc_w = max(0, cx - 12)
             self.breadcrumb_bar.setGeometry(0, 0, max_bc_w, h)
 
+        right_x = w - 4
+        if self.mode_island and self.mode_island.isVisible():
+            mi_w = 72
+            mi_h = 32
+            mi_x = right_x - mi_w
+            mi_y = (h - mi_h) // 2
+            self.mode_island.setGeometry(mi_x, mi_y, mi_w, mi_h)
+            right_x = mi_x - 8
+
         if self.sort_button and self.sort_button.isVisible():
-            sb_size = self.sort_button.sizeHint()
-            sb_w = max(sb_size.width() + 16, 76)
+            sb_w = 34
             sb_h = 30
-            sb_x = w - sb_w - 4
+            sb_x = right_x - sb_w
             sb_y = (h - sb_h) // 2
             self.sort_button.setGeometry(sb_x, sb_y, sb_w, sb_h)
 
@@ -265,6 +372,8 @@ class MainWindow(QMainWindow):
         self.album_sort_mode: str = getattr(config, "album_sort_mode", "artist_year")
         self.artist_sort_mode: str = getattr(config, "artist_sort_mode", "name_asc")
         self.genre_sort_mode: str = getattr(config, "genre_sort_mode", "name_asc")
+        self.view_mode: str = getattr(config, "view_mode", "tiles")
+        self._table_sort: Dict[str, tuple] = {}
 
         # Audio player controller
         self.player_controller = PlayerController(self)
@@ -341,7 +450,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.btn_import)
 
         self.btn_rescan = _toolbar_button("Rescan Library")
-        self.btn_rescan.clicked.connect(lambda: self.start_scanning(force=True))
+        self.btn_rescan.clicked.connect(self._on_rescan_clicked)
         top_bar.addWidget(self.btn_rescan)
 
         self.btn_settings = _toolbar_button("Settings")
@@ -361,13 +470,24 @@ class MainWindow(QMainWindow):
         top_bar.addStretch()
 
         # Search field
+        self.search_tracks_check = QCheckBox("Search tracks")
+        self.search_tracks_check.setObjectName("searchTracksCheck")
+        self.search_tracks_check.setFont(QFont("Segoe UI", 9))
+        self.search_tracks_check.setToolTip(
+            "Search inside track titles and file names. Results are albums that contain a matching track."
+        )
+        self.search_tracks_check.toggled.connect(self._on_search_tracks_toggled)
+        top_bar.addWidget(self.search_tracks_check)
+
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("searchEdit")
-        self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self._update_search_placeholder()
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textEdited.connect(self._on_search_text_edited)
         self.search_edit.textChanged.connect(self._on_search_text_changed)
         top_bar.addWidget(self.search_edit)
+
+
 
         main_layout.addLayout(top_bar)
 
@@ -388,16 +508,19 @@ class MainWindow(QMainWindow):
             }
         """)
 
+        self.view_switcher_frame.setFixedSize(252, 32)
+        self.view_switcher_frame.setMask(_rounded_rect_mask(252, 32, 7))
         view_switcher_layout = QHBoxLayout(self.view_switcher_frame)
-        view_switcher_layout.setContentsMargins(3, 3, 3, 3)
+        view_switcher_layout.setContentsMargins(0, 0, 0, 0)
         view_switcher_layout.setSpacing(0)
 
-        self.btn_view_artists = QPushButton("Artists")
-        self.btn_view_albums = QPushButton("Albums")
-        self.btn_view_genres = QPushButton("Genres")
+        self.btn_view_artists = SegmentButton("Artists")
+        self.btn_view_albums = SegmentButton("Albums")
+        self.btn_view_genres = SegmentButton("Genres")
 
         for btn in (self.btn_view_artists, self.btn_view_albums, self.btn_view_genres):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedSize(84, 32)
 
         self.btn_view_artists.clicked.connect(lambda: self.set_view("artists"))
         self.btn_view_albums.clicked.connect(lambda: self.set_view("albums"))
@@ -407,14 +530,51 @@ class MainWindow(QMainWindow):
         view_switcher_layout.addWidget(self.btn_view_albums)
         view_switcher_layout.addWidget(self.btn_view_genres)
 
+        # Separate Tiles/Table island, placed to the left of Sort.
+        self.mode_island_frame = QFrame()
+        self.mode_island_frame.setObjectName("modeIsland")
+        self.mode_island_frame.setFixedSize(72, 32)
+        self.mode_island_frame.setMask(_rounded_rect_mask(72, 32, 7))
+        mode_layout = QHBoxLayout(self.mode_island_frame)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.setSpacing(0)
+
+        self.btn_mode_tiles = SegmentButton()
+        self.btn_mode_table = SegmentButton()
+        for _btn, _tip in (
+            (self.btn_mode_tiles, "Tiles view"),
+            (self.btn_mode_table, "Table view"),
+        ):
+            _btn.setCheckable(True)
+            _btn.setAutoExclusive(True)
+            _btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            _btn.setToolTip(_tip)
+            _btn.setFixedSize(36, 32)
+            _btn.setIconSize(QSize(20, 20))
+            _btn.setObjectName("viewModeBtn")
+            mode_layout.addWidget(_btn)
+        self.btn_mode_tiles.setIcon(get_tinted_icon("tiles_view.png", 20, self.theme))
+        self.btn_mode_table.setIcon(get_tinted_icon("table_view.png", 20, self.theme))
+        self.btn_mode_tiles.clicked.connect(lambda: self._set_view_mode("tiles"))
+        self.btn_mode_table.clicked.connect(lambda: self._set_view_mode("table"))
+
         # Right: Sort button (opens context menu with sorting options)
-        self.btn_sort = QPushButton("Sort ▾")
+        self.btn_sort = QPushButton("")
         self.btn_sort.setObjectName("btnSort")
         self.btn_sort.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort.setToolTip("Sort")
+        self.btn_sort.setFixedSize(34, 30)
+        self.btn_sort.setIcon(get_tinted_icon("Sort_button.png", 17, self.theme))
+        self.btn_sort.setIconSize(QSize(17, 17))
         self.btn_sort.clicked.connect(self._show_sort_menu)
 
         self.nav_row_widget = NavRowWidget(content_widget)
-        self.nav_row_widget.set_widgets(self.breadcrumb_bar, self.view_switcher_frame, self.btn_sort)
+        self.nav_row_widget.set_widgets(
+            self.breadcrumb_bar,
+            self.view_switcher_frame,
+            self.btn_sort,
+            self.mode_island_frame,
+        )
         main_layout.addWidget(self.nav_row_widget)
 
         self._update_view_buttons_style()
@@ -455,6 +615,17 @@ class MainWindow(QMainWindow):
         self._albums_flow_layout = self._albums_container_widget.layout()
         self._artists_flow_layout = self._artists_container_widget.layout()
         self._genres_flow_layout = self._genres_container_widget.layout()
+        self._albums_table = self._albums_page._catalog_table
+        self._artists_table = self._artists_page._catalog_table
+        self._genres_table = self._genres_page._catalog_table
+        for _table in (self._albums_table, self._artists_table, self._genres_table):
+            _table.horizontalHeader().sectionClicked.connect(self._on_table_header_clicked)
+            _table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
+            _table.cellClicked.connect(self._on_table_cell_clicked)
+            _table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            _table.customContextMenuRequested.connect(
+                lambda pos, t=_table: self._on_table_context_menu(t, pos)
+            )
 
         self.catalog_stack = QStackedWidget()
         self.catalog_stack.addWidget(self._albums_page)
@@ -473,6 +644,8 @@ class MainWindow(QMainWindow):
         self.album_detail_view.genre_clicked.connect(self._go_to_genre)
         self.album_detail_view.year_clicked.connect(self._search_year)
         self.album_detail_view.track_location_requested.connect(self._on_track_location_requested)
+        self.album_detail_view.track_edit_requested.connect(self._on_edit_track)
+        self.album_detail_view.track_remove_requested.connect(self._on_remove_track)
         self.main_stack.addWidget(self.album_detail_view)
 
         # Page 2: Statistics View
@@ -549,6 +722,7 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.status_bar.addPermanentWidget(self.progress_bar)
+        self._apply_view_mode_visibility()
 
     def _check_first_launch(self):
         if getattr(self, "_closing", False):
@@ -606,7 +780,22 @@ class MainWindow(QMainWindow):
         layout = FlowLayout(container, margin=10, h_spacing=18, v_spacing=18)
         container.setLayout(layout)
         scroll.setWidget(container)
+
+        table = QTableWidget(page)
+        table.setObjectName("catalogTable")
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(False)
+        table.setShowGrid(False)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setHighlightSections(False)
+        table.horizontalHeader().setSectionsClickable(True)
+        table.hide()
+
         page_layout.addWidget(scroll, 1)
+        page_layout.addWidget(table, 1)
+        page._catalog_table = table
         return page, scroll, header, header_layout
 
     def _catalog_page_index(self, view_name: Optional[str] = None) -> int:
@@ -677,7 +866,8 @@ class MainWindow(QMainWindow):
             config.save()
             if added:
                 self.status_info_label.setText(f"Added library folder: {directory}")
-            self.start_scanning(force=True)
+                # Only scan the newly added root; the other libraries stay untouched.
+                self.start_scanning(force=False, paths=[directory], delete_scope=[directory])
 
     def _on_show_about(self):
         dlg = AboutDialog(self, theme=self.theme)
@@ -686,11 +876,52 @@ class MainWindow(QMainWindow):
     def _on_open_settings(self):
         dlg = SettingsDialog(self)
         dlg.settings_saved.connect(self._on_settings_saved)
+        dlg.libraries_added.connect(self._on_libraries_added)
+        dlg.libraries_removed.connect(self._on_libraries_removed)
         dlg.exec()
 
     def _on_settings_saved(self):
         self.apply_theme(getattr(config, "theme", "dark"))
         self.update_scrollbars()
+        self.refresh_library_view()
+
+    def _on_libraries_added(self, paths):
+        if paths:
+            self.start_scanning(force=False, paths=list(paths), delete_scope=list(paths))
+
+    def _on_libraries_removed(self, items):
+        cover_candidates: set[str] = set()
+        for path, delete_cache in items:
+            try:
+                root = Path(path).expanduser().resolve()
+                rows = self.db_conn.execute("SELECT file_path, cover_cache_path FROM tracks").fetchall()
+                for row in rows:
+                    try:
+                        Path(row["file_path"]).resolve().relative_to(root)
+                    except Exception:
+                        continue
+                    if row["cover_cache_path"]:
+                        cover_candidates.add(row["cover_cache_path"])
+            except Exception:
+                pass
+            delete_tracks_under_root(self.db_conn, path)
+            if delete_cache and cover_candidates:
+                remaining = {
+                    row["cover_cache_path"]
+                    for row in self.db_conn.execute(
+                        "SELECT cover_cache_path FROM tracks WHERE cover_cache_path IS NOT NULL"
+                    ).fetchall()
+                    if row["cover_cache_path"]
+                }
+                cache_root = Path(getattr(config_module, "CACHE_DIR", ""))
+                for cover in cover_candidates - remaining:
+                    try:
+                        cover_path = Path(cover)
+                        cover_path.relative_to(cache_root)
+                        cover_path.unlink(missing_ok=True)
+                    except Exception:
+                        continue
+                cover_candidates.clear()
         self.refresh_library_view()
 
     def update_scrollbars(self):
@@ -704,8 +935,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, "statistics_view") and hasattr(self.statistics_view, "update_scrollbars"):
             self.statistics_view.update_scrollbars()
 
-    def start_scanning(self, force: bool = False):
-        existing_roots = [p for p in config.library_paths if Path(p).exists()]
+    def _on_rescan_clicked(self):
+        paths = list(getattr(config, "library_paths", []))
+        if not paths:
+            QMessageBox.warning(self, "Warning", "Please select a valid library folder first.")
+            return
+        if len(paths) == 1:
+            self.start_scanning(force=True, paths=paths, delete_scope=paths)
+            return
+        dialog = RescanLibrariesDialog(paths, self)
+        if dialog.exec():
+            selected = dialog.selected_paths()
+            if selected:
+                self.start_scanning(force=True, paths=selected, delete_scope=selected)
+
+    def start_scanning(self, force: bool = False, paths=None, delete_scope=None):
+        scan_paths = list(paths) if paths is not None else list(config.library_paths)
+        existing_roots = [p for p in scan_paths if Path(p).exists()]
         if not existing_roots:
             QMessageBox.warning(self, "Warning", "Please select a valid library folder first.")
             return
@@ -719,10 +965,11 @@ class MainWindow(QMainWindow):
         self.scan_status_label.setText("Preparing to scan...")
 
         self.scanner_thread = LibraryScanner(
-            config.library_paths,
+            scan_paths,
             config.db_path,
             force_rescan=force,
             naming_format=config.track_naming_format,
+            delete_scope=delete_scope if delete_scope is not None else scan_paths,
         )
         self.scanner_thread.progress.connect(self._on_scan_progress)
         self.scanner_thread.status_text.connect(self._on_scan_status_text)
@@ -753,6 +1000,8 @@ class MainWindow(QMainWindow):
     def set_view(self, view_name: str):
         if view_name not in ("artists", "albums", "genres"):
             return
+        if getattr(self, "search_tracks_check", None) and self.search_tracks_check.isChecked() and view_name != "albums":
+            return
         self.current_view = view_name
         self.prev_view = view_name
         if hasattr(self, "album_page"):
@@ -775,16 +1024,12 @@ class MainWindow(QMainWindow):
             self.main_stack.setCurrentIndex(0)
         if hasattr(self, "catalog_stack"):
             self._set_catalog_page(view_name)
+        if hasattr(self, "btn_mode_tiles"):
+            self._apply_view_mode_visibility()
         if hasattr(self, "btn_sort"):
-            self.btn_sort.show()
+            self.btn_sort.setVisible(self.view_mode != "table" and not self.is_stats_mode)
 
-        if view_name == "artists":
-            self.search_edit.setPlaceholderText("🔍 Search artists...")
-        elif view_name == "genres":
-            self.search_edit.setPlaceholderText("🔍 Search genres...")
-        else:
-            self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
-
+        self._update_search_placeholder()
         self._update_breadcrumb()
         self.refresh_current_view()
 
@@ -795,9 +1040,13 @@ class MainWindow(QMainWindow):
                 self.btn_sort.hide()
             if hasattr(self, "breadcrumb_bar"):
                 self.breadcrumb_bar.hide()
+            if hasattr(self, "mode_island_frame"):
+                self.mode_island_frame.hide()
             self.main_stack.setCurrentWidget(self.statistics_view)
             self.statistics_view.set_category(self.current_view if self.current_view in ("artists", "albums", "genres") else "albums")
         else:
+            if hasattr(self, "mode_island_frame"):
+                self.mode_island_frame.show()
             if hasattr(self, "btn_sort"):
                 self.btn_sort.setVisible(self.current_view == "albums" and not self.artist_filter and not self.genre_filter)
             if self.current_view == "album_detail":
@@ -842,81 +1091,42 @@ class MainWindow(QMainWindow):
 
     def _update_view_buttons_style(self):
         is_light = getattr(self, "theme", "dark") == "light"
-        if is_light:
-            active_style = """
-                QPushButton {
-                    background-color: #ffffff;
-                    color: #1f2328;
-                    font-weight: 600;
-                    font-size: 8.5pt;
-                    border-radius: 5px;
-                    border: none;
-                    padding: 0px 14px;
-                    min-height: 26px;
-                    max-height: 26px;
-                }
-            """
-            inactive_style = """
-                QPushButton {
-                    background-color: transparent;
-                    color: #656d76;
-                    font-weight: 500;
-                    font-size: 8.5pt;
-                    border-radius: 5px;
-                    border: none;
-                    padding: 0px 14px;
-                    min-height: 26px;
-                    max-height: 26px;
-                }
-                QPushButton:hover {
-                    background-color: rgba(0, 0, 0, 0.05);
-                    border: none;
-                    color: #1f2328;
-                }
-                QPushButton:pressed {
-                    background-color: rgba(0, 0, 0, 0.10);
-                    border: none;
-                }
-            """
-        else:
-            active_style = """
-                QPushButton {
-                    background-color: #0b0d10;
-                    color: #ffffff;
-                    font-weight: 600;
-                    font-size: 8.5pt;
-                    border-radius: 5px;
-                    border: none;
-                    padding: 0px 14px;
-                    min-height: 26px;
-                    max-height: 26px;
-                }
-            """
-            inactive_style = """
-                QPushButton {
-                    background-color: transparent;
-                    color: #8b949e;
-                    font-weight: 500;
-                    font-size: 8.5pt;
-                    border-radius: 5px;
-                    border: none;
-                    padding: 0px 14px;
-                    min-height: 26px;
-                    max-height: 26px;
-                }
-                QPushButton:hover {
-                    background-color: rgba(255, 255, 255, 0.08);
-                    border: none;
-                    color: #c9d1d9;
-                }
-                QPushButton:pressed {
-                    background-color: rgba(255, 255, 255, 0.12);
-                    border: none;
-                }
-            """
-        self.btn_view_artists.setStyleSheet(active_style if self.current_view == "artists" else inactive_style)
-        self.btn_view_albums.setStyleSheet(active_style if self.current_view == "albums" else inactive_style)
-        self.btn_view_genres.setStyleSheet(active_style if self.current_view == "genres" else inactive_style)
+        fill = "#ffffff" if is_light else "#0b0d10"
+        active_text = "#1f2328" if is_light else "#ffffff"
+        inactive_text = "#656d76" if is_light else "#8b949e"
+        hover = "rgba(0,0,0,0.05)" if is_light else "rgba(255,255,255,0.08)"
+        disabled_text = "#4b5563" if is_light else "#6e7681"
+        divider = "rgba(127,127,127,0.28)"
+        track_search = bool(
+            getattr(self, "search_tracks_check", None) and self.search_tracks_check.isChecked()
+        )
+
+        segments = (
+            (self.btn_view_artists, "artists", "left"),
+            (self.btn_view_albums, "albums", "none"),
+            (self.btn_view_genres, "genres", "right"),
+        )
+        for index, (button, view, radius) in enumerate(segments):
+            if button is None:
+                continue
+            active = self.current_view == view
+            disabled = track_search and view != "albums"
+            text_color = disabled_text if disabled else (active_text if active else inactive_text)
+            weight = 600 if active and not disabled else 500
+            button.setStyleSheet(
+                "QPushButton {"
+                f" background:transparent; color:{text_color};"
+                f" font-weight:{weight}; font-size:8.5pt; padding:0px;"
+                " border: none; min-height:32px; max-height:32px;"
+                "}"
+            )
+            segment_fill = fill if active and not disabled else "transparent"
+            segment_hover = (
+                hover if not active and not disabled else "transparent"
+            )
+            button.set_segment_style(
+                segment_fill, segment_hover, radius, divider, index < 2
+            )
 
     # ------------------------------------------------------------------
     # Breadcrumb navigation
@@ -939,7 +1149,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_sort"):
             self.btn_sort.show()
         self._update_view_buttons_style()
-        self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self._update_search_placeholder()
         self._update_breadcrumb()
         self.refresh_current_view()
 
@@ -979,7 +1189,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_sort"):
             self.btn_sort.show()
         self._update_view_buttons_style()
-        self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+        self._update_search_placeholder()
         self._update_breadcrumb()
         self.refresh_current_view()
 
@@ -1290,10 +1500,14 @@ class MainWindow(QMainWindow):
 
     def _on_search_text_edited(self, text: str):
         self.album_page = 0
+        if hasattr(self, "scroll_area"):
+            self.scroll_area.verticalScrollBar().setValue(0)
         if hasattr(self, "search_timer"):
             self.search_timer.start()
 
     def _on_search_text_changed(self, text: str):
+        if getattr(self, "search_tracks_check", None) and self.search_tracks_check.isChecked() and text.strip():
+            self._prepare_track_search_mode()
         if not text:
             self.album_page = 0
             if hasattr(self, "search_timer"):
@@ -1302,72 +1516,419 @@ class MainWindow(QMainWindow):
         elif hasattr(self, "search_timer") and not self.search_timer.isActive():
             self.refresh_current_view()
 
+    def _prepare_track_search_mode(self):
+        """Track search is albums-only and tiles-only, without re-rendering."""
+        if self.current_view != "albums" or self.artist_filter or self.genre_filter:
+            self.current_view = "albums"
+            self.artist_filter = None
+            self.genre_filter = None
+            self.prev_view = "albums"
+            if hasattr(self, "main_stack"):
+                self.main_stack.setCurrentIndex(0)
+            if hasattr(self, "catalog_stack"):
+                self._set_catalog_page("albums")
+            self._update_view_buttons_style()
+        if self.view_mode != "tiles":
+            self.view_mode = "tiles"
+            config.view_mode = "tiles"
+            config.save()
+            self._apply_view_mode_visibility()
+
+    def _update_search_placeholder(self):
+        if getattr(self, "search_tracks_check", None) and self.search_tracks_check.isChecked():
+            self.search_edit.setPlaceholderText("🔍 Search inside track titles and file names.")
+        elif self.current_view == "artists":
+            self.search_edit.setPlaceholderText("🔍 Search artists...")
+        elif self.current_view == "genres":
+            self.search_edit.setPlaceholderText("🔍 Search genres...")
+        else:
+            self.search_edit.setPlaceholderText("🔍 Search by album, artist, year...")
+
+    def _track_search_active(self, query: Optional[str] = None) -> bool:
+        if not getattr(self, "search_tracks_check", None) or not self.search_tracks_check.isChecked():
+            return False
+        text = (query if query is not None else self.search_edit.text()).strip()
+        return len(text) >= 2
+
+    def _update_track_search_navigation(self):
+        enabled = not self.search_tracks_check.isChecked()
+        if hasattr(self, "btn_view_artists"):
+            self.btn_view_artists.setEnabled(enabled)
+            self.btn_view_genres.setEnabled(enabled)
+            if hasattr(self, "btn_view_albums"):
+                self._update_view_buttons_style()
+
+    def _on_search_tracks_toggled(self, checked: bool):
+        self._update_track_search_navigation()
+        self._update_search_placeholder()
+        query = self.search_edit.text().strip()
+        # Toggling the mode with an empty search box changes only the box
+        # placeholder and navigation state. Re-rendering the library here
+        # would produce a pointless visible flicker.
+        if not query:
+            return
+        self.album_page = 0
+        self._invalidate_view_caches()
+        if checked:
+            self._prepare_track_search_mode()
+        self.refresh_current_view()
+
+    def _set_view_mode(self, mode: str):
+        if mode not in ("tiles", "table"):
+            return
+        if mode == "table" and self._track_search_active():
+            if hasattr(self, "btn_mode_tiles"):
+                self.btn_mode_tiles.setChecked(True)
+            QMessageBox.information(
+                self, "Track search",
+                "Track search results are shown as tiles only. Turn off “Search tracks” to use the table view.",
+            )
+            return
+        self.view_mode = mode
+        config.view_mode = mode
+        config.save()
+        self._apply_view_mode_visibility()
+        self.refresh_current_view()
+
+    def _toggle_view_mode(self):
+        self._set_view_mode("table" if self.view_mode == "tiles" else "tiles")
+
+    def _apply_view_mode_visibility(self):
+        table_mode = self.view_mode == "table" and not self._track_search_active()
+        for page, scroll, table in (
+            (self._albums_page, self._albums_scroll_area, self._albums_table),
+            (self._artists_page, self._artists_scroll_area, self._artists_table),
+            (self._genres_page, self._genres_scroll_area, self._genres_table),
+        ):
+            scroll.setVisible(not table_mode)
+            table.setVisible(table_mode)
+        if hasattr(self, "btn_mode_tiles"):
+            self.btn_mode_tiles.setChecked(not table_mode)
+            self.btn_mode_table.setChecked(table_mode)
+            is_light = getattr(self, "theme", "dark") == "light"
+            active_color = (0, 0, 0) if is_light else (255, 255, 255)
+            fill = "#ffffff" if is_light else "#0b0d10"
+            hover = "rgba(0,0,0,0.06)" if is_light else "rgba(255,255,255,0.08)"
+            mode_qss = "QPushButton { background:transparent; border:none; padding:0px; }"
+            self.btn_mode_tiles.setStyleSheet(mode_qss)
+            self.btn_mode_table.setStyleSheet(mode_qss)
+            self.btn_mode_tiles.set_segment_style(
+                fill if not table_mode else "transparent",
+                hover if table_mode else "transparent",
+                "left",
+                "rgba(127,127,127,0.28)",
+                True,
+            )
+            self.btn_mode_table.set_segment_style(
+                fill if table_mode else "transparent",
+                hover if not table_mode else "transparent",
+                "right",
+                "rgba(127,127,127,0.28)",
+                False,
+            )
+            self.btn_mode_tiles.setIcon(get_tinted_icon(
+                "tiles_view.png", 20, self.theme, active_color if not table_mode else None
+            ))
+            self.btn_mode_table.setIcon(get_tinted_icon(
+                "table_view.png", 20, self.theme, active_color if table_mode else None
+            ))
+        if hasattr(self, "btn_sort"):
+            self.btn_sort.setVisible(not table_mode and not self.is_stats_mode)
+        if table_mode:
+            for header in (self._albums_pager_header, self._artists_pager_header, self._genres_pager_header):
+                header.hide()
+        else:
+            self.container_widget.show()
+            if self._albums_pager_layout.count() > 2:
+                self._albums_pager_header.show()
+
+    def _render_catalog_table(self, query: str = ""):
+        self._empty_state_active = False
+        self._cancel_incremental_album_render()
+        self._apply_view_mode_visibility()
+        view = self.current_view
+        table = self._table_for_view(view)
+        if table is None:
+            return
+        table.setUpdatesEnabled(False)
+        try:
+            table.clear()
+            table.clearSpans()
+            table.setSortingEnabled(False)
+            if view == "albums":
+                headers = ["Album", "Artist", "Year", "Tracks"]
+                rows = self._table_album_rows(query)
+                key_fn = lambda r, c: (
+                    str(r.get("album", "")).casefold() if c == 0 else
+                    str(r.get("display_artist") or r.get("album_artist", "")).casefold() if c == 1 else
+                    parse_year_int(r.get("year")) if c == 2 else
+                    int(r.get("track_count", 0))
+                )
+            elif view == "artists":
+                headers = ["Artist", "Albums", "Tracks"]
+                rows = self._table_artist_rows(query)
+                key_fn = lambda r, c: (
+                    str(r.get("name", "")).casefold() if c == 0 else
+                    int(r.get("album_count", 0)) if c == 1 else
+                    int(r.get("track_count", 0))
+                )
+            else:
+                headers = ["Genre", "Albums", "Tracks"]
+                rows = self._table_genre_rows(query)
+                key_fn = lambda r, c: (
+                    str(r.get("genre", "")).casefold() if c == 0 else
+                    int(r.get("album_count", 0)) if c == 1 else
+                    int(r.get("track_count", 0))
+                )
+
+            column, ascending = self._table_sort.get(view, (0, True))
+            column = min(column, len(headers) - 1)
+            rows.sort(key=lambda r: key_fn(r, column), reverse=not ascending)
+            if not rows:
+                table.setColumnCount(len(headers))
+                table.setHorizontalHeaderLabels(headers)
+                table.setRowCount(1)
+                empty_item = QTableWidgetItem("No matching items found.")
+                empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                table.setItem(0, 0, empty_item)
+                table.setSpan(0, 0, 1, len(headers))
+                table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                self._active_empty_label().hide()
+                self.container_widget.hide()
+                table.show()
+                return
+            arrow = " ▲" if ascending else " ▼"
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(
+                [h + (arrow if i == column else "") for i, h in enumerate(headers)]
+            )
+            table.setRowCount(len(rows))
+            for row_idx, data in enumerate(rows):
+                values = (
+                    [data.get("album", ""), data.get("display_artist") or data.get("album_artist", ""),
+                     str(data.get("year", "")), str(data.get("track_count", 0))]
+                    if view == "albums" else
+                    [data.get("name", ""), str(data.get("album_count", 0)), str(data.get("track_count", 0))]
+                    if view == "artists" else
+                    [data.get("genre", ""), str(data.get("album_count", 0)), str(data.get("track_count", 0))]
+                )
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if col == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, data)
+                    table.setItem(row_idx, col, item)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            table.resizeRowsToContents()
+            self._active_empty_label().hide()
+            self.container_widget.hide()
+            table.show()
+        finally:
+            table.setUpdatesEnabled(True)
+
+    def _style_tables(self):
+        light = getattr(self, "theme", "dark") == "light"
+        if light:
+            style = (
+                "QTableWidget#catalogTable { background:#ffffff; color:#1f2328; border:none;"
+                " alternate-background-color:#ffffff; selection-background-color:#eaeef2;"
+                " selection-color:#0969da; }"
+                "QTableWidget#catalogTable::item { padding:6px 8px; border-bottom:1px solid #eaeef2; }"
+                "QHeaderView::section { background:#f6f8fa; color:#57606a; border:none;"
+                " border-bottom:1px solid #d0d7de; padding:8px; font-weight:600; }"
+            )
+        else:
+            style = (
+                "QTableWidget#catalogTable { background:#0d1117; color:#e6edf3; border:none;"
+                " alternate-background-color:#0d1117; selection-background-color:#1c2430;"
+                " selection-color:#58a6ff; }"
+                "QTableWidget#catalogTable::item { padding:6px 8px; border-bottom:1px solid #21262d; }"
+                "QHeaderView::section { background:#161b22; color:#8b949e; border:none;"
+                " border-bottom:1px solid #30363d; padding:8px; font-weight:600; }"
+            )
+        for table in (self._albums_table, self._artists_table, self._genres_table):
+            table.setStyleSheet(style)
+            table.verticalHeader().setDefaultSectionSize(34)
+
+    def _table_for_view(self, view: Optional[str] = None) -> Optional[QTableWidget]:
+        view = view or self.current_view
+        if view == "artists":
+            return self._artists_table
+        if view == "genres":
+            return self._genres_table
+        return self._albums_table
+
+    def _table_album_rows(self, query: str) -> List[Dict[str, Any]]:
+        if self.artist_filter:
+            source = get_albums_by_artist(self.db_conn, self.artist_filter, sort_mode=self.album_sort_mode)
+        elif self.genre_filter:
+            source = get_albums_by_genre(self.db_conn, self.genre_filter, sort_mode=self.album_sort_mode)
+        else:
+            source = self.all_albums_cache
+        if not query:
+            return list(source)
+        return [
+            a for a in source
+            if query in a["album"].lower()
+            or query in a["display_artist"].lower()
+            or query in a["album_artist"].lower()
+            or query in str(a.get("year", "")).lower()
+        ]
+
+    def _table_artist_rows(self, query: str) -> List[Dict[str, Any]]:
+        return [a for a in self.all_artists_cache if not query or query in a["name"].lower()]
+
+    def _table_genre_rows(self, query: str) -> List[Dict[str, Any]]:
+        return [g for g in self.all_genres_cache if not query or query in g["genre"].lower()]
+
+    def _on_table_header_clicked(self, section: int):
+        view = self.current_view
+        column, ascending = self._table_sort.get(view, (-1, True))
+        if column == section:
+            ascending = not ascending
+        else:
+            ascending = True
+        self._table_sort[view] = (section, ascending)
+        self.refresh_current_view()
+
+    def _on_table_cell_clicked(self, row: int, _column: int):
+        # Single click selects; double click opens. Kept separate so selecting
+        # a row does not navigate away unexpectedly.
+        pass
+
+    def _table_context_style(self) -> str:
+        if getattr(self, "theme", "dark") == "light":
+            return """
+                QMenu { background:#ffffff; color:#1f2328; border:1px solid #d0d7de; border-radius:6px; padding:4px; }
+                QMenu::item { padding:6px 18px; border-radius:4px; }
+                QMenu::item:selected { background:#f3f4f6; color:#0969da; }
+                QMenu::separator { height:1px; background:#d0d7de; margin:4px 2px; }
+            """
+        return """
+            QMenu { background:#1a1e24; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:4px; }
+            QMenu::item { padding:6px 18px; border-radius:4px; }
+            QMenu::item:selected { background:#262c36; color:#58a6ff; }
+            QMenu::separator { height:1px; background:#30363d; margin:4px 2px; }
+        """
+
+    def _on_table_context_menu(self, table: QTableWidget, pos):
+        row = table.rowAt(pos.y())
+        if row < 0:
+            return
+        item = table.item(row, 0)
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not data:
+            return
+        global_pos = table.viewport().mapToGlobal(pos)
+        if self.current_view == "albums":
+            self._show_album_table_menu(data, global_pos)
+        elif self.current_view == "artists":
+            self._show_artist_table_menu(data, global_pos)
+
+    def _show_album_table_menu(self, album: Dict[str, Any], global_pos):
+        menu = QMenu(self)
+        name = album.get("album", "")
+        artist = album.get("album_artist", "")
+        edit = QAction(get_tinted_icon("context_menu_edit_tags.png", 20, self.theme), "Edit album tags...", menu)
+        edit.triggered.connect(lambda: self._on_edit_album(name, artist))
+        menu.addAction(edit)
+        fix = QAction(get_tinted_icon("context_menu_fix_encoding.png", 20, self.theme), "Fix tags encoding", menu)
+        fix.setEnabled(bool(album.get("has_bad_encoding", False)))
+        fix.triggered.connect(lambda: self._on_fix_album_encoding(name, artist))
+        menu.addAction(fix)
+        organize = QAction(get_tinted_icon("context_menu_organize.png", 20, self.theme), "Organize album files", menu)
+        try:
+            from malka.organizer import is_album_ready_to_organize
+            ready, _ = is_album_ready_to_organize(get_album_tracks(self.db_conn, name, artist))
+            organize.setEnabled(bool(ready) and not bool(album.get("is_organized", False)))
+        except Exception:
+            organize.setEnabled(False)
+        organize.triggered.connect(lambda: self._on_organize_album(name, artist))
+        menu.addAction(organize)
+        menu.addSeparator()
+        open_folder = QAction(
+            get_tinted_icon("context_menu_fix_open_in_file_manager.png", 20, self.theme),
+            "Open folder in file manager", menu,
+        )
+        open_folder.triggered.connect(lambda: self._on_open_album_folder(name, artist))
+        menu.addAction(open_folder)
+        menu.addSeparator()
+        remove = QAction(get_tinted_icon("context_menu_delete.png", 20, self.theme), "Remove album", menu)
+        remove.triggered.connect(lambda: self._on_remove_album(name, artist))
+        menu.addAction(remove)
+        menu.exec(global_pos)
+
+    def _show_artist_table_menu(self, artist: Dict[str, Any], global_pos):
+        menu = QMenu(self)
+        name = artist.get("name", "")
+        add_image = QAction(
+            get_tinted_icon("context_menu_edit_tags.png", 20, self.theme),
+            "Change artist image...", menu,
+        )
+        add_image.triggered.connect(lambda: self._table_change_artist_image(artist))
+        menu.addAction(add_image)
+        if artist.get("image_path"):
+            remove_image = QAction(
+                get_tinted_icon("context_menu_delete.png", 20, self.theme),
+                "Remove artist image", menu,
+            )
+            remove_image.triggered.connect(lambda: self._table_remove_artist_image(name))
+            menu.addAction(remove_image)
+        menu.exec(global_pos)
+
+    def _table_change_artist_image(self, artist: Dict[str, Any]):
+        card = ArtistCard(artist, self.db_conn, self)
+        card.image_updated.connect(self._on_artist_image_updated)
+        card._add_artist_image()
+        card.deleteLater()
+        self.refresh_current_view()
+
+    def _table_remove_artist_image(self, artist_name: str):
+        set_artist_image(self.db_conn, artist_name, None)
+        for art in self.all_artists_cache:
+            if art.get("name") == artist_name:
+                art["image_path"] = ""
+                break
+        self.refresh_current_view()
+
+    def _on_table_cell_double_clicked(self, row: int, _column: int):
+        table = self._table_for_view()
+        item = table.item(row, 0) if table else None
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not data:
+            return
+        if self.current_view == "albums":
+            self._on_album_clicked(data)
+        elif self.current_view == "artists":
+            self._on_artist_clicked(data.get("name", ""))
+        elif self.current_view == "genres":
+            self._on_genre_clicked(data.get("genre", ""))
+
     def _show_sort_menu(self):
         menu = QMenu(self)
         menu.setObjectName("sortMenu")
 
-        is_light = getattr(self, "theme", "dark") == "light"
-        if is_light:
-            menu.setStyleSheet("""
-                QMenu#sortMenu {
-                    background-color: #ffffff;
-                    color: #1f2328;
-                    border: 1px solid #d0d7de;
-                    border-radius: 8px;
-                    padding: 6px;
-                }
-                QMenu#sortMenu::item {
-                    padding: 6px 24px 6px 20px;
-                    border-radius: 6px;
-                    font-size: 8.5pt;
-                }
-                QMenu#sortMenu::item:selected {
-                    background-color: #f3f4f6;
-                    color: #0969da;
-                }
-            """)
-        else:
-            menu.setStyleSheet("""
-                QMenu#sortMenu {
-                    background-color: #1a1e24;
-                    color: #e6edf3;
-                    border: 1px solid #30363d;
-                    border-radius: 8px;
-                    padding: 6px;
-                }
-                QMenu#sortMenu::item {
-                    padding: 6px 24px 6px 20px;
-                    border-radius: 6px;
-                    font-size: 8.5pt;
-                }
-                QMenu#sortMenu::item:selected {
-                    background-color: #262c36;
-                    color: #58a6ff;
-                }
-            """)
-
         # If in Albums view or drilled into an artist or genre (which displays albums)
         if self.current_view == "albums" or self.artist_filter or self.genre_filter:
             options = [
-                ("artist_year", "Artist & Year"),
-                ("year_asc", "Year (Ascending)"),
-                ("year_desc", "Year (Descending)"),
-                ("title_asc", "Title (Ascending)"),
-                ("title_desc", "Title (Descending)"),
+                ("artist_year", "Artist + Year"),
+                ("year_asc", "Year ↑"),
+                ("year_desc", "Year ↓"),
+                ("title_asc", "Title ↑"),
+                ("title_desc", "Title ↓"),
             ]
             active_mode = self.album_sort_mode
             category = "album"
         elif self.current_view == "artists":
             options = [
-                ("name_asc", "Name (Ascending)"),
-                ("name_desc", "Name (Descending)"),
+                ("name_asc", "Name ↑"),
+                ("name_desc", "Name ↓"),
             ]
             active_mode = self.artist_sort_mode
             category = "artist"
         elif self.current_view == "genres":
             options = [
-                ("name_asc", "Name (Ascending)"),
-                ("name_desc", "Name (Descending)"),
+                ("name_asc", "Name ↑"),
+                ("name_desc", "Name ↓"),
             ]
             active_mode = self.genre_sort_mode
             category = "genre"
@@ -1437,6 +1998,16 @@ class MainWindow(QMainWindow):
                 self.btn_sort.show()
 
         self._update_breadcrumb()
+
+        if self._track_search_active(query) and self.view_mode != "tiles":
+            self.view_mode = "tiles"
+            config.view_mode = "tiles"
+            config.save()
+            self._apply_view_mode_visibility()
+
+        if self.view_mode == "table" and not self._track_search_active(query):
+            self._render_catalog_table(query)
+            return
 
         if self.current_view == "artists":
             self._render_artists(query)
@@ -1549,6 +2120,7 @@ class MainWindow(QMainWindow):
             self.container_widget.setUpdatesEnabled(True)
             return
 
+        self._empty_state_active = False
         self.flow_layout.setEnabled(False)
         try:
             self.flow_layout.clear()
@@ -1562,11 +2134,11 @@ class MainWindow(QMainWindow):
                     filtered.append(art)
 
             if not filtered:
-                if not artists:
-                    self._active_empty_label().setText("No artists found in the library.")
-                else:
-                    self._active_empty_label().setText("No artists found matching the search query.")
-                self._active_empty_label().show()
+                self._show_empty_message(
+                    "No artists found in the library."
+                    if not artists
+                    else "No artists found matching the search query."
+                )
                 return
 
             self._active_empty_label().hide()
@@ -1582,8 +2154,9 @@ class MainWindow(QMainWindow):
             # otherwise every addWidget() triggers an O(n) relayout of the grid.
             self.flow_layout.setEnabled(True)
             self.flow_layout.invalidate()
-            self._update_container_height()
-            self._store_view_cache("artists", cache_key)
+            if not getattr(self, "_empty_state_active", False):
+                self._update_container_height()
+                self._store_view_cache("artists", cache_key)
             self.container_widget.show()
             self.container_widget.setUpdatesEnabled(True)
 
@@ -1596,6 +2169,7 @@ class MainWindow(QMainWindow):
             self.container_widget.setUpdatesEnabled(True)
             return
 
+        self._empty_state_active = False
         self.flow_layout.setEnabled(False)
         try:
             self.flow_layout.clear()
@@ -1609,11 +2183,11 @@ class MainWindow(QMainWindow):
                     filtered.append(g)
 
             if not filtered:
-                if not genres:
-                    self._active_empty_label().setText("No genres found in the library.")
-                else:
-                    self._active_empty_label().setText("No genres found matching the search query.")
-                self._active_empty_label().show()
+                self._show_empty_message(
+                    "No genres found in the library."
+                    if not genres
+                    else "No genres found matching the search query."
+                )
                 return
 
             self._active_empty_label().hide()
@@ -1628,8 +2202,9 @@ class MainWindow(QMainWindow):
             # otherwise every addWidget() triggers an O(n) relayout of the grid.
             self.flow_layout.setEnabled(True)
             self.flow_layout.invalidate()
-            self._update_container_height()
-            self._store_view_cache("genres", cache_key)
+            if not getattr(self, "_empty_state_active", False):
+                self._update_container_height()
+                self._store_view_cache("genres", cache_key)
             self.container_widget.show()
             self.container_widget.setUpdatesEnabled(True)
 
@@ -1640,6 +2215,7 @@ class MainWindow(QMainWindow):
         card.fix_encoding_requested.connect(self._on_fix_album_encoding)
         card.organize_requested.connect(self._on_organize_album)
         card.open_folder_requested.connect(self._on_open_album_folder)
+        card.remove_requested.connect(self._on_remove_album)
         return card
 
     def _build_album_render_items(self, filtered: List[Dict[str, Any]]) -> List[tuple]:
@@ -1808,6 +2384,7 @@ class MainWindow(QMainWindow):
         if not batch:
             self._store_view_cache("albums", state["cache_key"])
             self._incremental_albums = None
+            self._schedule_visible_covers()
             return
 
         pending = state.setdefault("pending", [])
@@ -1934,6 +2511,70 @@ class MainWindow(QMainWindow):
             # Card was deleted by a refresh between queue steps.
             _advance()
 
+    def _show_empty_message(self, text: str):
+        """Clears stale tiles/cache and shows a single empty-state message."""
+        self._empty_state_active = True
+        self._cancel_incremental_album_render()
+        self._cancel_cover_loading()
+        if hasattr(self, "flow_layout"):
+            self.flow_layout.clear()
+        if hasattr(self, "_view_caches"):
+            self._view_caches.pop(self.current_view, None)
+        if self.current_view == "albums" and hasattr(self, "_update_album_pager"):
+            self._update_album_pager(1, [])
+        label = self._active_empty_label()
+        label.setText(text)
+        viewport = self.scroll_area.viewport()
+        w = max(1, viewport.width())
+        h = max(1, viewport.height())
+        self.container_widget.setFixedSize(w, h)
+        label.setGeometry(0, 0, w, h)
+        label.show()
+        label.raise_()
+        self.container_widget.show()
+        self.container_widget.setUpdatesEnabled(True)
+        bar = self.scroll_area.verticalScrollBar()
+        bar.setValue(0)
+        fade = getattr(self, "_scroll_fades", {}).get(self.scroll_area.viewport())
+        if fade is not None:
+            fade.set_strength(0.0)
+
+    def _track_search_albums(self, query: str, album_source: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        q = query.casefold()
+        album_map: Dict[tuple, Dict[str, Any]] = {}
+        for album in album_source:
+            key = (str(album.get("album", "")).casefold(), str(album.get("album_artist", "")).casefold())
+            album_map[key] = dict(album)
+        matches: Dict[tuple, List[str]] = {}
+        try:
+            rows = self.db_conn.execute(
+                "SELECT album, album_artist, title, file_path FROM tracks"
+            ).fetchall()
+        except Exception:
+            return []
+        for row in rows:
+            key = (str(row["album"]).casefold(), str(row["album_artist"]).casefold())
+            if key not in album_map:
+                continue
+            title = str(row["title"] or "")
+            filename = Path(str(row["file_path"] or "")).name
+            if q in title.casefold():
+                display = title
+            elif q in filename.casefold():
+                display = filename
+            else:
+                continue
+            bucket = matches.setdefault(key, [])
+            if display not in bucket:
+                bucket.append(display)
+        result = []
+        for key, names in matches.items():
+            album = album_map[key]
+            album["_track_matches"] = names[:8]
+            album["_track_query"] = query
+            result.append(album)
+        return sort_albums(result, self.album_sort_mode)
+
     def _render_albums(self, filter_text: str = ""):
         cache_key = (
             filter_text,
@@ -1942,6 +2583,7 @@ class MainWindow(QMainWindow):
             self.album_sort_mode,
             self._data_revision,
             self.album_page,
+            self.search_tracks_check.isChecked(),
         )
         self.container_widget.setUpdatesEnabled(False)
         if self._begin_view_render("albums", cache_key):
@@ -1950,6 +2592,7 @@ class MainWindow(QMainWindow):
             self._schedule_visible_covers()
             return
         self.container_widget.hide()
+        self._empty_state_active = False
 
         incremental_started = False
         covers_to_load: List[AlbumCard] = []
@@ -1965,6 +2608,30 @@ class MainWindow(QMainWindow):
             else:
                 album_source = self.all_albums_cache
 
+            tracks_mode = self.search_tracks_check.isChecked()
+            raw_query = self.search_edit.text().strip()
+            if tracks_mode and raw_query and len(raw_query) < 2:
+                self._show_empty_message(
+                    "Type at least 2 characters to search tracks."
+                )
+                return
+            if tracks_mode and len(raw_query) >= 2:
+                filtered = self._track_search_albums(raw_query, album_source)
+                if not filtered:
+                    self._show_empty_message("No tracks found matching the search query.")
+                    return
+                self.empty_label.hide()
+                page_count = max(1, (len(filtered) + self.album_page_size - 1) // self.album_page_size)
+                if self.album_page >= page_count:
+                    self.album_page = page_count - 1
+                all_items = [("album", alb) for alb in filtered]
+                page_start = self.album_page * self.album_page_size
+                render_items = all_items[page_start:page_start + self.album_page_size]
+                self._update_album_pager(page_count, all_items)
+                incremental_started = True
+                self._begin_incremental_album_render(render_items, cache_key)
+                return
+
             filtered = []
             for alb in album_source:
                 if not filter_text:
@@ -1978,11 +2645,11 @@ class MainWindow(QMainWindow):
                     filtered.append(alb)
 
             if not filtered:
-                if not album_source:
-                    self.empty_label.setText("No albums found in this category.")
-                else:
-                    self.empty_label.setText("No albums found matching the search query.")
-                self.empty_label.show()
+                self._show_empty_message(
+                    "No albums found in this category."
+                    if not album_source
+                    else "No albums found matching the search query."
+                )
                 return
 
             self.empty_label.hide()
@@ -2013,8 +2680,9 @@ class MainWindow(QMainWindow):
             if not incremental_started:
                 self.flow_layout.setEnabled(True)
                 self.flow_layout.invalidate()
-                self._update_container_height()
-                self._store_view_cache("albums", cache_key)
+                if not getattr(self, "_empty_state_active", False):
+                    self._update_container_height()
+                    self._store_view_cache("albums", cache_key)
                 self.container_widget.show()
                 self.container_widget.setUpdatesEnabled(True)
                 self._schedule_visible_covers()
@@ -2049,6 +2717,8 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _resize_catalog_page(self, scroll: QScrollArea):
+        if getattr(self, "_empty_state_active", False):
+            return
         if getattr(self, "_catalog_resize_guard", False):
             return
         container = scroll.widget()
@@ -2242,11 +2912,20 @@ class MainWindow(QMainWindow):
                 self.view_switcher_frame.setStyleSheet("""
                     QFrame#viewSwitcherFrame {
                         background-color: #eaeef2;
-                        border: 1px solid #d0d7de;
+                        border: none;
+                        border-radius: 7px;
+                    }
+                """)
+            if hasattr(self, "mode_island_frame"):
+                self.mode_island_frame.setStyleSheet("""
+                    QFrame#modeIsland {
+                        background-color: #eaeef2;
+                        border: none;
                         border-radius: 7px;
                     }
                 """)
             if hasattr(self, "btn_sort"):
+                self.btn_sort.setIcon(get_tinted_icon("Sort_button.png", 17, "light"))
                 self.btn_sort.setStyleSheet("""
                     QPushButton#btnSort {
                         background-color: #eaeef2;
@@ -2422,11 +3101,20 @@ class MainWindow(QMainWindow):
                 self.view_switcher_frame.setStyleSheet("""
                     QFrame#viewSwitcherFrame {
                         background-color: #1a1e24;
-                        border: 1px solid #282e38;
+                        border: none;
+                        border-radius: 7px;
+                    }
+                """)
+            if hasattr(self, "mode_island_frame"):
+                self.mode_island_frame.setStyleSheet("""
+                    QFrame#modeIsland {
+                        background-color: #1a1e24;
+                        border: none;
                         border-radius: 7px;
                     }
                 """)
             if hasattr(self, "btn_sort"):
+                self.btn_sort.setIcon(get_tinted_icon("Sort_button.png", 17, "dark"))
                 self.btn_sort.setStyleSheet("""
                     QPushButton#btnSort {
                         background-color: #1a1e24;
@@ -2477,7 +3165,83 @@ class MainWindow(QMainWindow):
             for widget in cache.get("widgets", []):
                 if hasattr(widget, "apply_theme"):
                     widget.apply_theme(theme)
+        if hasattr(self, "btn_mode_tiles"):
+            self._apply_view_mode_visibility()
+        if hasattr(self, "search_tracks_check"):
+            text_col = "#57606a" if theme == "light" else "#c9d1d9"
+            accent = "#0969da" if theme == "light" else "#1f6feb"
+            self.search_tracks_check.setStyleSheet(
+                f"QCheckBox#searchTracksCheck {{ color:{text_col}; font-size:8.5pt; spacing:5px; }}"
+                f"QCheckBox#searchTracksCheck::indicator {{ width:14px; height:14px; }}"
+                f"QCheckBox#searchTracksCheck::indicator:checked {{ background:{accent}; border-color:{accent}; }}"
+            )
         self.update_scrollbars()
+        self._style_tables()
+
+        check_path = get_resource_path("checkmark.png").replace("\\", "/")
+        menu_bg = "#ffffff" if theme == "light" else "#1a1e24"
+        menu_fg = "#1f2328" if theme == "light" else "#e6edf3"
+        menu_border = "#d0d7de" if theme == "light" else "#30363d"
+        menu_hover = "#f3f4f6" if theme == "light" else "#262c36"
+        menu_accent = "#0969da" if theme == "light" else "#58a6ff"
+        menu_disabled = "#8c959f" if theme == "light" else "#6e7681"
+        check_border = "#d0d7de" if theme == "light" else "#3c3c3c"
+        check_bg = "#ffffff" if theme == "light" else "#1e1e1e"
+        check_accent = "#0969da" if theme == "light" else "#1f6feb"
+        extra = f"""
+            QMenu {{
+                background-color: {menu_bg};
+                color: {menu_fg};
+                border: 1px solid {menu_border};
+                border-radius: 8px;
+                padding: 6px;
+            }}
+            QMenu::item {{
+                padding: 7px 26px 7px 36px;
+                border-radius: 6px;
+            }}
+            QMenu::icon {{
+                left: 9px;
+                width: 20px;
+                height: 20px;
+            }}
+            QMenu::item:selected {{
+                background-color: {menu_hover};
+                color: {menu_accent};
+            }}
+            QMenu::item:disabled {{
+                color: {menu_disabled};
+            }}
+            QMenu#sortMenu::item {{
+                padding-left: 8px;
+            }}
+            QMenu#sortMenu::indicator {{
+                width: 14px;
+                height: 14px;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {menu_border};
+                margin: 5px 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 1px solid {check_border};
+                border-radius: 4px;
+                background-color: {check_bg};
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: {check_accent};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {check_accent};
+                border-color: {check_accent};
+                image: url("{check_path}");
+                image-position: center;
+            }}
+        """
+        self.setStyleSheet(self.styleSheet() + extra)
 
     def _on_edit_album(self, album_name: str, album_artist: str):
         tracks = get_album_tracks(self.db_conn, album_name, album_artist)
@@ -2502,6 +3266,112 @@ class MainWindow(QMainWindow):
                 self.refresh_library_view()
         finally:
             token = suspend_state.pop("token", None)
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+
+    def _remove_files_to_trash(self, file_paths: List[str]) -> tuple[list[str], list[str]]:
+        removed, failed = [], []
+        for file_path in file_paths:
+            if not file_path:
+                continue
+            if move_to_recycle_bin(file_path):
+                removed.append(file_path)
+            else:
+                failed.append(file_path)
+        return removed, failed
+
+    def _on_remove_album(self, album_name: str, album_artist: str):
+        tracks = get_album_tracks(self.db_conn, album_name, album_artist)
+        if not tracks:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove Album",
+            f"Remove album “{album_name}” by {album_artist}?\n\n"
+            f"{len(tracks)} audio file(s) will be moved to the Recycle Bin and their database records deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        file_paths = [t.get("file_path", "") for t in tracks if t.get("file_path")]
+        token = self.player_controller.suspend_for_file_operation(file_paths)
+        try:
+            removed, failed = self._remove_files_to_trash(file_paths)
+            if removed:
+                delete_tracks_by_paths(self.db_conn, removed)
+            if failed:
+                QMessageBox.warning(
+                    self, "Remove Album",
+                    "Some files could not be moved to the Recycle Bin and were kept:\n" + "\n".join(failed[:8]),
+                )
+            self.refresh_library_view()
+            if self.current_view == "album_detail":
+                self._go_all_albums()
+        finally:
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+
+    def _on_remove_track(self, track: Dict[str, Any]):
+        file_path = track.get("file_path", "")
+        title = track.get("title", Path(file_path).name)
+        answer = QMessageBox.question(
+            self,
+            "Remove Track",
+            f"Remove track “{title}”?\n\n"
+            "The audio file will be moved to the Recycle Bin and its database record deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        token = self.player_controller.suspend_for_file_operation([file_path] if file_path else [])
+        try:
+            removed, failed = self._remove_files_to_trash([file_path] if file_path else [])
+            if removed:
+                delete_tracks_by_paths(self.db_conn, removed)
+            if failed:
+                QMessageBox.warning(self, "Remove Track", "The file could not be moved to the Recycle Bin.")
+                return
+            album_data = dict(self.album_detail_view.album_data or {})
+            self.refresh_library_view()
+            if self.current_view == "album_detail" and album_data.get("album"):
+                remaining = get_album_tracks(self.db_conn, album_data.get("album", ""), album_data.get("album_artist", ""))
+                if remaining:
+                    self._on_album_clicked(album_data)
+                else:
+                    self._go_all_albums()
+        finally:
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+
+    def _on_edit_track(self, track: Dict[str, Any]):
+        file_path = track.get("file_path", "")
+        if not file_path:
+            return
+        token = None
+
+        def on_started():
+            nonlocal token
+            if token is None:
+                token = self.player_controller.suspend_for_file_operation([file_path])
+
+        def on_finished(success: bool):
+            nonlocal token
+            if token:
+                self.player_controller.resume_after_file_operation(token)
+                token = None
+
+        dlg = EditTrackDialog(track, self.db_conn, parent=self, theme=self.theme)
+        dlg.operation_about_to_start.connect(on_started)
+        dlg.operation_finished.connect(on_finished)
+        try:
+            if dlg.exec():
+                album_data = dict(self.album_detail_view.album_data or {})
+                self.refresh_library_view()
+                if self.current_view == "album_detail" and album_data.get("album"):
+                    self._on_album_clicked(album_data)
+        finally:
             if token:
                 self.player_controller.resume_after_file_operation(token)
 

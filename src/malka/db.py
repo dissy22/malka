@@ -398,13 +398,63 @@ def set_track_organized(conn: sqlite3.Connection, track_id: int, organized: int)
         pass
 
 
-def delete_missing_tracks(conn: sqlite3.Connection, existing_paths: set) -> int:
+def _is_under_roots(file_path: str, roots: List[Path]) -> bool:
+    if not roots:
+        return True
+    try:
+        target = Path(file_path).expanduser().resolve()
+    except Exception:
+        return False
+    for root in roots:
+        try:
+            target.relative_to(root)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def delete_missing_tracks(conn: sqlite3.Connection, existing_paths: set, roots=None) -> int:
+    """Delete DB tracks missing on disk, optionally only under the given roots.
+
+    Restricting roots is essential for incremental library scans: scanning a
+    newly added folder must never remove tracks belonging to other libraries.
+    """
+    scope_roots = [Path(str(r)).expanduser().resolve() for r in roots] if roots else []
     cursor = conn.cursor()
     cursor.execute("SELECT id, file_path FROM tracks")
     rows = cursor.fetchall()
     deleted = 0
     for row in rows:
-        if row["file_path"] not in existing_paths:
+        if row["file_path"] in existing_paths:
+            continue
+        if scope_roots and not _is_under_roots(row["file_path"], scope_roots):
+            continue
+        cursor.execute("DELETE FROM tracks WHERE id = ?", (row["id"],))
+        deleted += 1
+    conn.commit()
+    return deleted
+
+
+def delete_tracks_by_paths(conn: sqlite3.Connection, paths: List[str]) -> int:
+    deleted = 0
+    cursor = conn.cursor()
+    for path in paths:
+        cursor.execute("DELETE FROM tracks WHERE file_path = ?", (str(path),))
+        deleted += cursor.rowcount
+    conn.commit()
+    return deleted
+
+
+def delete_tracks_under_root(conn: sqlite3.Connection, root: str) -> int:
+    """Remove every DB track that belongs to a library root without rescanning."""
+    root_path = Path(str(root)).expanduser().resolve()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, file_path FROM tracks")
+    rows = cursor.fetchall()
+    deleted = 0
+    for row in rows:
+        if _is_under_roots(row["file_path"], [root_path]):
             cursor.execute("DELETE FROM tracks WHERE id = ?", (row["id"],))
             deleted += 1
     conn.commit()

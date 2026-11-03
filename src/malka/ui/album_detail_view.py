@@ -30,11 +30,13 @@ from malka.config import NO_DATA, config
 from malka.db import get_album_tracks
 from malka.player import PlayerController, format_time_ms, is_file_playable
 from malka.ui.audio_info import request_audio_info
+from malka.ui.menu_utils import context_menu_qss
 from malka.ui.image_utils import (
     create_square_placeholder,
     get_cached_square_pixmap,
     get_resource_icon,
     get_resource_pixmap,
+    get_tinted_icon,
     request_async_square_pixmap,
 )
 
@@ -106,6 +108,8 @@ class TrackRowWidget(QFrame):
 
     track_clicked = pyqtSignal(dict)  # emits track dict
     location_requested = pyqtSignal(dict)  # right-click -> reveal file in file manager
+    edit_requested = pyqtSignal(dict)  # right-click -> edit this track's tags
+    remove_requested = pyqtSignal(dict)  # right-click -> remove track
 
     def __init__(self, track: Dict[str, Any], album_artist: str, is_active: bool = False, is_playing: bool = False, db_conn=None, theme: str = "dark", parent=None):
         super().__init__(parent)
@@ -259,48 +263,31 @@ class TrackRowWidget(QFrame):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        menu.setStyleSheet(context_menu_qss(self.theme))
         self.context_menu = menu
-        is_light = (self.theme == "light")
-        if is_light:
-            menu.setStyleSheet("""
-                QMenu {
-                    background-color: #ffffff;
-                    color: #1f2328;
-                    border: 1px solid #d0d7de;
-                    border-radius: 8px;
-                    padding: 4px;
-                }
-                QMenu::item {
-                    padding: 6px 18px;
-                    border-radius: 5px;
-                }
-                QMenu::item:selected {
-                    background-color: #f3f4f6;
-                    color: #0969da;
-                }
-            """)
-        else:
-            menu.setStyleSheet("""
-                QMenu {
-                    background-color: #1a1e24;
-                    color: #e6edf3;
-                    border: 1px solid #30363d;
-                    border-radius: 8px;
-                    padding: 4px;
-                }
-                QMenu::item {
-                    padding: 6px 18px;
-                    border-radius: 5px;
-                }
-                QMenu::item:selected {
-                    background-color: #262c36;
-                    color: #58a6ff;
-                }
-            """)
 
-        open_location_action = QAction("Open file location", menu)
+        edit_tags_action = QAction(
+            get_tinted_icon("context_menu_edit_tags.png", 20, self.theme),
+            "Edit track tags", menu,
+        )
+        edit_tags_action.triggered.connect(lambda: self.edit_requested.emit(self.track))
+        menu.addAction(edit_tags_action)
+        menu.addSeparator()
+
+        open_location_action = QAction(
+            get_tinted_icon("context_menu_fix_open_in_file_manager.png", 20, self.theme),
+            "Open file location", menu,
+        )
         open_location_action.triggered.connect(lambda: self.location_requested.emit(self.track))
         menu.addAction(open_location_action)
+
+        menu.addSeparator()
+        remove_action = QAction(
+            get_tinted_icon("context_menu_delete.png", 20, self.theme),
+            "Remove track", menu,
+        )
+        remove_action.triggered.connect(lambda: self.remove_requested.emit(self.track))
+        menu.addAction(remove_action)
         menu.exec(event.globalPos())
 
     def set_active_state(self, is_active: bool, is_playing: bool):
@@ -317,6 +304,8 @@ class AlbumDetailView(QWidget):
     back_requested = pyqtSignal()
     track_play_requested = pyqtSignal(dict, dict, list)  # (track, album_data, all_tracks)
     track_location_requested = pyqtSignal(dict)  # reveal the track file in the file manager
+    track_edit_requested = pyqtSignal(dict)  # edit tags of a single track
+    track_remove_requested = pyqtSignal(dict)  # remove a single track
     artist_clicked = pyqtSignal(str)
     genre_clicked = pyqtSignal(str)
     year_clicked = pyqtSignal(str)
@@ -731,6 +720,8 @@ class AlbumDetailView(QWidget):
                     )
                     row.track_clicked.connect(self._on_track_clicked)
                     row.location_requested.connect(self.track_location_requested.emit)
+                    row.edit_requested.connect(self.track_edit_requested.emit)
+                    row.remove_requested.connect(self.track_remove_requested.emit)
                     self.track_rows.append(row)
                     self.tracks_container.addWidget(row)
         finally:

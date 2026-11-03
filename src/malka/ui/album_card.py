@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QPainter, QPixmap
+from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QLabel,
@@ -42,10 +42,102 @@ class CoverLabel(QWidget):
         painter.drawPixmap(0, 0, self._pixmap)
         painter.end()
 
+
+class TrackMatchOverlay(QWidget):
+    """Dark labels with matching track names drawn over an album cover."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.matches = []
+        self.query = ""
+        self.setFixedSize(170, 170)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def set_matches(self, matches, query: str):
+        self.matches = list(matches or [])
+        self.query = query or ""
+        self.setVisible(bool(self.matches))
+        self.update()
+
+    @staticmethod
+    def _fit_focus(text: str, query: str, max_width: int, fm) -> tuple:
+        low = text.casefold().find(query.casefold()) if query else -1
+        if fm.horizontalAdvance(text) <= max_width:
+            return text, low, low + len(query) if low >= 0 else -1
+        if low < 0:
+            return fm.elidedText(text, Qt.TextElideMode.ElideMiddle, max_width), -1, -1
+        start, end = 0, len(text)
+        ell = "…"
+        while start < low or end > low + len(query):
+            candidate = (ell if start else "") + text[start:end] + (ell if end < len(text) else "")
+            if fm.horizontalAdvance(candidate) <= max_width:
+                break
+            before = low - start
+            after = end - (low + len(query))
+            if before >= after and start < low:
+                start += 1
+            elif end > low + len(query):
+                end -= 1
+            elif start < low:
+                start += 1
+            else:
+                break
+        prefix = ell if start else ""
+        suffix = ell if end < len(text) else ""
+        display = prefix + text[start:end] + suffix
+        mstart = (len(prefix) if prefix else 0) + (low - start)
+        return display, mstart, mstart + len(query)
+
+    def paintEvent(self, event):
+        if not self.matches:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        font = QFont("Segoe UI", 7, QFont.Weight.Bold)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        box_w = self.width() - 12
+        line_h = 22
+        if len(self.matches) > 6:
+            visible_matches = self.matches[:5] + [f"+{len(self.matches) - 5} more matching tracks"]
+        else:
+            visible_matches = self.matches
+        for idx, original in enumerate(visible_matches):
+            text, mstart, mend = self._fit_focus(original, self.query, box_w - 10, fm)
+            x = 6
+            y = 7 + idx * (line_h + 3)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(Qt.GlobalColor.black)
+            painter.setOpacity(0.45)
+            painter.drawRoundedRect(x + 1, y + 2, box_w, line_h, 4, 4)
+            painter.setOpacity(0.88)
+            painter.drawRoundedRect(x, y, box_w, line_h, 4, 4)
+            painter.setOpacity(1.0)
+
+            baseline = y + (line_h + fm.ascent() - fm.descent()) // 2
+            tx = x + 5
+            if mstart < 0:
+                painter.setPen(Qt.GlobalColor.white)
+                painter.drawText(tx, baseline, text)
+                continue
+            prefix, match, suffix = text[:mstart], text[mstart:mend], text[mend:]
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(tx, baseline, prefix)
+            tx += fm.horizontalAdvance(prefix)
+            painter.setPen(QColor("#58a6ff"))
+            painter.drawText(tx, baseline, match)
+            tx += fm.horizontalAdvance(match)
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(tx, baseline, suffix)
+        painter.end()
+
 from malka.config import NO_DATA, config
+from malka.ui.menu_utils import context_menu_qss
 from malka.ui.image_utils import (
     create_square_placeholder,
     get_cached_square_pixmap,
+    get_tinted_icon,
     request_async_square_pixmap,
 )
 
@@ -56,6 +148,7 @@ class AlbumCard(QFrame):
     fix_encoding_requested = pyqtSignal(str, str)  # album, album_artist
     organize_requested = pyqtSignal(str, str)  # album, album_artist
     open_folder_requested = pyqtSignal(str, str)
+    remove_requested = pyqtSignal(str, str)  # album, album_artist
 
     def __init__(
         self,
@@ -239,6 +332,13 @@ class AlbumCard(QFrame):
 
         layout.addStretch()
 
+        matches = self.album_data.get("_track_matches") or []
+        if matches:
+            self.track_overlay = TrackMatchOverlay(self.cover_label)
+            self.track_overlay.set_matches(matches, self.album_data.get("_track_query", ""))
+            self.track_overlay.show()
+            self.track_overlay.raise_()
+
     def _set_blank_cover(self):
         """Empty tile fill shown until this album's cover is loaded."""
         placeholder = create_square_placeholder(
@@ -354,37 +454,14 @@ class AlbumCard(QFrame):
         """Builds (but does not show) the album context menu."""
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
+        menu.setStyleSheet(context_menu_qss(self.theme))
         self.context_menu = menu
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #2b2b2b;
-                color: #ffffff;
-                border: 1px solid #3c3c3c;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 20px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #383838;
-            }
-            QMenu::item:disabled {
-                color: #6e7681;
-                background-color: transparent;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #3c3c3c;
-                margin: 4px 0px;
-            }
-        """)
 
-        edit_action = QAction("Edit album tags...", self)
+        edit_action = QAction(get_tinted_icon("context_menu_edit_tags.png", 20, self.theme), "Edit album tags...", self)
         edit_action.triggered.connect(lambda: self.edit_requested.emit(self.album, self.album_artist))
         menu.addAction(edit_action)
 
-        fix_encoding_action = QAction("Fix tags encoding", self)
+        fix_encoding_action = QAction(get_tinted_icon("context_menu_fix_encoding.png", 20, self.theme), "Fix tags encoding", self)
         fix_encoding_action.setEnabled(self.has_bad_encoding)
         if self.has_bad_encoding:
             fix_encoding_action.setToolTip("Rewrite this album's tags using the detected source character encoding.")
@@ -407,7 +484,7 @@ class AlbumCard(QFrame):
         elif ready is None:
             ready = True
 
-        organize_action = QAction("Organize album files", self)
+        organize_action = QAction(get_tinted_icon("context_menu_organize.png", 20, self.theme), "Organize album files", self)
         if self.is_organized:
             ready = False
             tooltip = "All files are already in the library layout"
@@ -420,8 +497,16 @@ class AlbumCard(QFrame):
 
         menu.addSeparator()
 
-        open_folder_action = QAction("Open folder in file manager", self)
+        open_folder_action = QAction(
+            get_tinted_icon("context_menu_fix_open_in_file_manager.png", 20, self.theme),
+            "Open folder in file manager", self,
+        )
         open_folder_action.triggered.connect(lambda: self.open_folder_requested.emit(self.album, self.album_artist))
         menu.addAction(open_folder_action)
+
+        menu.addSeparator()
+        remove_action = QAction(get_tinted_icon("context_menu_delete.png", 20, self.theme), "Remove album", self)
+        remove_action.triggered.connect(lambda: self.remove_requested.emit(self.album, self.album_artist))
+        menu.addAction(remove_action)
 
         return menu
