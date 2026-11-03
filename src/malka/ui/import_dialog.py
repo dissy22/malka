@@ -46,6 +46,7 @@ class ImportDialog(BaseAlbumEditDialog):
     """
 
     def __init__(self, analysis: ImportAnalysisResult, parent=None, theme: Optional[str] = None):
+        self.require_complete_tags = True
         self.analysis = analysis
         self.hires = bool(analysis.is_hires) or is_hires(analysis.sample_rate, analysis.bits_per_sample)
         stored = config.get_import_settings(analysis.source_kind)

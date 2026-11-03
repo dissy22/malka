@@ -39,7 +39,9 @@ class CoverLabel(QWidget):
         if self._pixmap is None or self._pixmap.isNull():
             return
         painter = QPainter(self)
-        painter.drawPixmap(0, 0, self._pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.rect(), self._pixmap)
         painter.end()
 
 

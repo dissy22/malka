@@ -12,7 +12,9 @@ env/
 
 # Build artifacts / releases
 build/
+build_*/
 dist/
+dist_*/
 release/
 *.exe
 *.msi

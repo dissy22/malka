@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QFileDialog,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -420,6 +422,58 @@ class CoverPreviewWidget(QWidget):
         return rounded
 
 
+class SaveProgressDialog(QDialog):
+    """Modal progress dialog shown while tag/artwork changes are written."""
+
+    def __init__(self, total: int, parent=None, theme: str = "dark"):
+        super().__init__(parent)
+        self.setWindowTitle("Saving changes")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setModal(True)
+        self.setFixedSize(560, 160)
+        self.setStyleSheet(
+            "QDialog { background-color:#ffffff; color:#1f2328; }"
+            "QLabel { color:#1f2328; font-size:12px; }"
+            "QLabel#saveTitle { font-size:14px; font-weight:700; }"
+            "QProgressBar { border:1px solid #d0d7de; border-radius:5px;"
+            " background:#f6f8fa; height:16px; text-align:center; }"
+            "QProgressBar::chunk { background:#0969da; border-radius:4px; }"
+            if theme == "light" else
+            "QDialog { background-color:#0d1117; color:#e6edf3; }"
+            "QLabel { color:#e6edf3; font-size:12px; }"
+            "QLabel#saveTitle { font-size:14px; font-weight:700; }"
+            "QProgressBar { border:1px solid #30363d; border-radius:5px;"
+            " background:#161b22; height:16px; text-align:center; }"
+            "QProgressBar::chunk { background:#1f6feb; border-radius:4px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
+        title = QLabel("Saving changes")
+        title.setObjectName("saveTitle")
+        layout.addWidget(title)
+        self.operation_label = QLabel("Preparing files…")
+        self.operation_label.setWordWrap(True)
+        layout.addWidget(self.operation_label)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(0)
+        self.progress.setFormat("%v / %m")
+        layout.addWidget(self.progress)
+        layout.addStretch(1)
+
+    def set_operation(self, text: str, value: int):
+        self.operation_label.setText(text)
+        self.progress.setValue(max(0, min(value, self.progress.maximum())))
+        QApplication.processEvents()
+
+    def finish(self):
+        self.progress.setValue(self.progress.maximum())
+        QApplication.processEvents()
+        self.accept()
+
+
 class BaseAlbumEditDialog(QDialog):
     """
     Unified base dialog for album and single-track metadata editing.
@@ -431,6 +485,7 @@ class BaseAlbumEditDialog(QDialog):
         self.tracks = [dict(t) for t in tracks]
         self._initial_tracks = [dict(t) for t in tracks]
         self.current_single_track_idx = -1
+        self.require_complete_tags = bool(getattr(self, "require_complete_tags", False))
         self._lookup_buttons: List[QPushButton] = []
         self._field_buttons: Dict[str, List[QPushButton]] = {}
         self._search_worker = None
@@ -1843,6 +1898,19 @@ class BaseAlbumEditDialog(QDialog):
         self._populate_initial_data()
         self._set_status("Tags reloaded from the editor snapshot.", "info")
 
+    def _show_saved_message(self, text: str):
+        """Non-blocking completion message with an OK button."""
+        box = QMessageBox(None)
+        box.setWindowTitle("Changes saved")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setStyleSheet(self.styleSheet())
+        self._saved_message_box = box
+        box.open()
+
     def _validate_readiness(self) -> bool:
         # Check readiness for organization / import
         ready, msg = is_album_ready_to_organize(self.tracks)
@@ -1853,7 +1921,10 @@ class BaseAlbumEditDialog(QDialog):
             col = "#1a7f37" if is_light else "#3fb950"
             self.status_lbl.setStyleSheet(f"color: {col}; font-size: 12px; font-weight: 500;")
         else:
-            self.btn_action.setEnabled(False)
+            # Editing/cover-only saves must remain possible even if the album is
+            # not ready for automatic organization. ImportDialog explicitly
+            # opts into the stricter behaviour.
+            self.btn_action.setEnabled(not self.require_complete_tags)
             self.status_lbl.setText(f"⚠ {msg}")
             col = "#9a6700" if is_light else "#d29922"
             self.status_lbl.setStyleSheet(f"color: {col}; font-size: 12px; font-weight: 500;")
@@ -1899,10 +1970,17 @@ class EditAlbumDialog(BaseAlbumEditDialog):
         fix_enc = self.fix_encoding_checkbox.isChecked()
 
         success = False
+        total = len(self.tracks)
+        progress = SaveProgressDialog(total, self, theme=self.theme)
+        progress.show()
         self.operation_about_to_start.emit()
         try:
-            for t in self.tracks:
+            for index, t in enumerate(self.tracks, start=1):
                 file_path = t["file_path"]
+                progress.set_operation(
+                    f"Writing tags: {Path(file_path).name} ({index}/{total})…",
+                    index - 1,
+                )
 
                 if fix_enc:
                     from malka.tags import detect_and_fix_encoding
@@ -1963,14 +2041,21 @@ class EditAlbumDialog(BaseAlbumEditDialog):
                 update_track(self.db_conn, t["id"], db_data)
 
             self.db_conn.commit()
+            progress.set_operation("Updating the library database…", total)
             success = True
         except Exception as e:
+            progress.accept()
             QMessageBox.critical(self, "Save Error", f"Failed to save changes to tags: {e}")
         finally:
             self.operation_finished.emit(success)
+            if success:
+                progress.finish()
 
         if success:
             self.accept()
+            self._show_saved_message(
+                f"Successfully saved changes to {total} file{'s' if total != 1 else ''}."
+            )
 
 
 class EditTrackDialog(BaseAlbumEditDialog):
@@ -1994,10 +2079,13 @@ class EditTrackDialog(BaseAlbumEditDialog):
         self._save_current_single_track_form()
         fix_enc = self.fix_encoding_checkbox.isChecked()
         success = False
+        progress = SaveProgressDialog(1, self, theme=self.theme)
+        progress.show()
         self.operation_about_to_start.emit()
         try:
             t = self.tracks[0]
             file_path = t["file_path"]
+            progress.set_operation(f"Writing tags: {Path(file_path).name}…", 0)
             if fix_enc:
                 from malka.tags import detect_and_fix_encoding
                 for k in ("title", "artist", "album_artist", "album", "genre"):
@@ -2049,10 +2137,15 @@ class EditTrackDialog(BaseAlbumEditDialog):
             }
             update_track(self.db_conn, t["id"], db_data)
             self.db_conn.commit()
+            progress.set_operation("Updating the library database…", 1)
             success = True
         except Exception as e:
+            progress.accept()
             QMessageBox.critical(self, "Save Error", f"Failed to save track tags: {e}")
         finally:
             self.operation_finished.emit(success)
+            if success:
+                progress.finish()
         if success:
             self.accept()
+            self._show_saved_message("Track tags and artwork saved.")
