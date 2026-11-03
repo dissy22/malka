@@ -1,8 +1,8 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -265,6 +265,7 @@ COMMON_LIGHT_STYLESHEET = """
 
 class CoverPreviewWidget(QWidget):
     cover_changed = pyqtSignal(str)  # "new", "delete", "keep"
+    search_requested = pyqtSignal()
 
     def __init__(self, size: int = 120, parent=None, theme: str = "dark"):
         super().__init__(parent)
@@ -291,6 +292,12 @@ class CoverPreviewWidget(QWidget):
         self.btn_add.clicked.connect(self._on_add_cover)
         btn_layout.addWidget(self.btn_add)
 
+        self.btn_search = QPushButton("Search for cover art online")
+        self.btn_search.setObjectName("searchCoverBtn")
+        self.btn_search.setToolTip("Search Discogs using the Album, Artist and Year fields")
+        self.btn_search.clicked.connect(self.search_requested.emit)
+        btn_layout.addWidget(self.btn_search)
+
         self.btn_delete = QPushButton("Delete Cover")
         self.btn_delete.clicked.connect(self._on_delete_cover)
         btn_layout.addWidget(self.btn_delete)
@@ -302,7 +309,26 @@ class CoverPreviewWidget(QWidget):
 
     def apply_theme(self, theme: str):
         self.theme = theme
+        if theme == "light":
+            self.btn_search.setStyleSheet(
+                "QPushButton { background:#0969da; border:1px solid #0969da;"
+                " color:#ffffff; font-weight:600; padding:7px 12px; border-radius:5px; }"
+                "QPushButton:hover { background:#0860ca; }"
+            )
+        else:
+            self.btn_search.setStyleSheet(
+                "QPushButton { background:#1f6feb; border:1px solid #388bfd;"
+                " color:#ffffff; font-weight:600; padding:7px 12px; border-radius:5px; }"
+                "QPushButton:hover { background:#388bfd; }"
+            )
         self._update_preview()
+
+    def set_controls_enabled(self, loaded: bool, search_enabled: bool):
+        self.btn_add.setEnabled(loaded)
+        self.btn_search.setEnabled(loaded and search_enabled)
+        self.btn_delete.setEnabled(
+            loaded and (bool(self.original_image_path) or self.action == "new")
+        )
 
     def set_original_cover(self, path: Optional[str]):
         self.original_image_path = path if path and Path(path).exists() else None
@@ -403,8 +429,20 @@ class BaseAlbumEditDialog(QDialog):
     def __init__(self, tracks: List[Dict[str, Any]], parent=None, theme: Optional[str] = None):
         super().__init__(parent)
         self.tracks = [dict(t) for t in tracks]
+        self._initial_tracks = [dict(t) for t in tracks]
         self.current_single_track_idx = -1
         self._lookup_buttons: List[QPushButton] = []
+        self._field_buttons: Dict[str, List[QPushButton]] = {}
+        self._search_worker = None
+        self._search_dialog = None
+        self._search_canceled = False
+        self._metadata_worker = None
+        self._metadata_dialog = None
+        self._metadata_canceled = False
+        self._metadata_target_field = ""
+        self._metadata_single = False
+        self._metadata_candidate = None
+        self._search_single = False
 
         if theme is not None:
             self.theme = theme
@@ -433,8 +471,8 @@ class BaseAlbumEditDialog(QDialog):
                 if self.has_bad_encoding:
                     break
 
-        self.resize(800, 600)
-        self.setMinimumSize(700, 520)
+        self.resize(1200, 720)
+        self.setMinimumSize(1040, 640)
 
         self._build_ui()
         if self.has_bad_encoding:
@@ -451,7 +489,18 @@ class BaseAlbumEditDialog(QDialog):
         self.theme = theme
         is_light = (theme == "light")
         self.setStyleSheet(COMMON_LIGHT_STYLESHEET if is_light else COMMON_DARK_STYLESHEET)
-        self.setStyleSheet(self.styleSheet() + checkbox_checkmark_qss())
+        panel_qss = (
+            "QFrame#editPanel { background:#ffffff; border:1px solid #d0d7de;"
+            " border-radius:8px; }"
+            "QLabel#editSectionTitle { font-size:14px; font-weight:700; color:#1f2328; }"
+            "QLabel#editSubtle { color:#656d76; font-size:11px; }"
+            if is_light else
+            "QFrame#editPanel { background:#161b22; border:1px solid #30363d;"
+            " border-radius:8px; }"
+            "QLabel#editSectionTitle { font-size:14px; font-weight:700; color:#ffffff; }"
+            "QLabel#editSubtle { color:#8b949e; font-size:11px; }"
+        )
+        self.setStyleSheet(self.styleSheet() + panel_qss + checkbox_checkmark_qss())
 
         if hasattr(self, "album_cover_widget"):
             self.album_cover_widget.apply_theme(theme)
@@ -465,11 +514,6 @@ class BaseAlbumEditDialog(QDialog):
                 " max-width:28px; min-height:28px; max-height:28px; }"
                 "QPushButton:hover { background:#eaeef2; border-color:#0969da; }"
             )
-            discogs_qss = (
-                "QPushButton { background:#0969da; border:1px solid #0969da;"
-                " border-radius:5px; color:#ffffff; padding:7px 14px; font-weight:600; }"
-                "QPushButton:hover { background:#0860ca; }"
-            )
         else:
             lookup_qss = (
                 "QPushButton { background:#21262d; border:1px solid #30363d;"
@@ -477,15 +521,10 @@ class BaseAlbumEditDialog(QDialog):
                 " max-width:28px; min-height:28px; max-height:28px; }"
                 "QPushButton:hover { background:#30363d; border-color:#58a6ff; }"
             )
-            discogs_qss = (
-                "QPushButton { background:#1f6feb; border:1px solid #388bfd;"
-                " border-radius:5px; color:#ffffff; padding:7px 14px; font-weight:600; }"
-                "QPushButton:hover { background:#388bfd; }"
-            )
+        icon_color = "#656d76" if is_light else "#8b949e"
         for button in self._lookup_buttons:
             button.setStyleSheet(lookup_qss)
-        if hasattr(self, "btn_discogs"):
-            self.btn_discogs.setStyleSheet(discogs_qss)
+            button.setIcon(self._search_icon(14, icon_color))
 
         title_col = "#57606a" if is_light else "#8b949e"
         if hasattr(self, "left_title"):
@@ -582,9 +621,10 @@ class BaseAlbumEditDialog(QDialog):
         bottom_layout.addWidget(self.status_lbl)
         bottom_layout.addStretch()
 
-        self.btn_discogs = QPushButton("Search Discogs…")
-        self.btn_discogs.clicked.connect(self._on_discogs_search)
-        bottom_layout.addWidget(self.btn_discogs)
+        self.btn_reload = QPushButton("Reload")
+        self.btn_reload.setToolTip("Discard edits and reload the tag values")
+        self.btn_reload.clicked.connect(self._on_reload)
+        bottom_layout.addWidget(self.btn_reload)
 
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self.reject)
@@ -599,54 +639,95 @@ class BaseAlbumEditDialog(QDialog):
         # Connect tab switching
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
+    @staticmethod
+    def _search_icon(size: int = 14, color: str = "#e6edf3") -> QIcon:
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(color), 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawEllipse(2, 2, size - 7, size - 7)
+        painter.drawLine(size - 5, size - 5, size - 1, size - 1)
+        painter.end()
+        return QIcon(pix)
+
+    def _lookup_button(self, field: str, tip: str) -> QPushButton:
+        button = QPushButton()
+        button.setIcon(self._search_icon(14))
+        button.setIconSize(QSize(14, 14))
+        button.setFixedSize(28, 28)
+        button.setToolTip(tip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(lambda: self._on_field_lookup(field))
+        self._lookup_buttons.append(button)
+        self._field_buttons.setdefault(field, []).append(button)
+        return button
+
     def _with_lookup(self, edit: QLineEdit, field: str, tip: str) -> QWidget:
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         layout.addWidget(edit, 1)
-        button = QPushButton("🔍")
-        button.setFixedSize(28, 28)
-        button.setToolTip(tip)
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.clicked.connect(lambda: self._on_discogs_field(field))
-        self._lookup_buttons.append(button)
-        layout.addWidget(button)
+        layout.addWidget(self._lookup_button(field, tip))
         return widget
 
     def _setup_album_tab(self):
-        layout = QVBoxLayout(self.tab_album)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        layout = QHBoxLayout(self.tab_album)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        form_panel = QFrame()
+        form_panel.setObjectName("editPanel")
+        form_panel_layout = QVBoxLayout(form_panel)
+        form_panel_layout.setContentsMargins(16, 14, 16, 14)
+        form_panel_layout.setSpacing(10)
+
+        tags_title = QLabel("Tags")
+        tags_title.setObjectName("editSectionTitle")
+        form_panel_layout.addWidget(tags_title)
+        tags_hint = QLabel("Values are read from the files and written back on save.")
+        tags_hint.setObjectName("editSubtle")
+        tags_hint.setWordWrap(True)
+        form_panel_layout.addWidget(tags_hint)
 
         form = QFormLayout()
-        form.setSpacing(10)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(9)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.album_edit = QLineEdit()
-        form.addRow("Album:", self._with_lookup(self.album_edit, "album", "Look up album title on Discogs"))
-
-        self.album_artist_edit = QLineEdit()
+        self.album_edit.setPlaceholderText("Album title")
+        self.album_edit.setClearButtonEnabled(True)
         form.addRow(
-            "Album artist:",
-            self._with_lookup(self.album_artist_edit, "album_artist", "Look up album artist on Discogs"),
+            "Album:",
+            self._with_lookup(self.album_edit, "album", "Find Album on Discogs using Artist + Year"),
         )
 
-        # Compilation checkbox
-        self.compilation_checkbox = QCheckBox("Compilation (Various Artists album)")
-        self.compilation_checkbox.toggled.connect(self._on_compilation_toggled)
-        # Checkboxes are album-level controls too: keep the tracks in sync.
-        self.compilation_checkbox.toggled.connect(self._on_album_fields_changed)
-        form.addRow("Compilation:", self.compilation_checkbox)
+        self.album_artist_edit = QLineEdit()
+        self.album_artist_edit.setPlaceholderText("Album artist")
+        self.album_artist_edit.setClearButtonEnabled(True)
+        form.addRow(
+            "Album artist:",
+            self._with_lookup(
+                self.album_artist_edit,
+                "album_artist",
+                "Fill Album artist from the selected Discogs release (needs Artist, Album and Year)",
+            ),
+        )
 
-        # Artist row with Checkbox underneath
         artist_widget = QWidget()
         artist_layout = QVBoxLayout(artist_widget)
         artist_layout.setContentsMargins(0, 0, 0, 0)
         artist_layout.setSpacing(4)
         self.artist_edit = QLineEdit()
+        self.artist_edit.setPlaceholderText("Track artist")
+        self.artist_edit.setClearButtonEnabled(True)
         artist_layout.addWidget(
-            self._with_lookup(self.artist_edit, "artist", "Look up artist on Discogs")
+            self._with_lookup(self.artist_edit, "artist", "Find Artist on Discogs using Album + Year")
         )
         self.artist_same_checkbox = QCheckBox("Apply this Artist to all tracks in album")
         self.artist_same_checkbox.setChecked(True)
@@ -654,134 +735,270 @@ class BaseAlbumEditDialog(QDialog):
         artist_layout.addWidget(self.artist_same_checkbox)
         form.addRow("Artist:", artist_widget)
 
+        year_genre_box = QWidget()
+        year_genre_layout = QHBoxLayout(year_genre_box)
+        year_genre_layout.setContentsMargins(0, 0, 0, 0)
+        year_genre_layout.setSpacing(6)
         self.year_edit = QLineEdit()
-        form.addRow("Year:", self._with_lookup(self.year_edit, "year", "Look up year on Discogs"))
-
+        self.year_edit.setPlaceholderText("e.g. 2005")
+        self.year_edit.setFixedWidth(100)
+        year_genre_layout.addWidget(self.year_edit)
+        year_genre_layout.addWidget(
+            self._lookup_button("year", "Find Year on Discogs using Artist + Album")
+        )
+        year_genre_layout.addSpacing(6)
+        year_genre_layout.addWidget(QLabel("Genre:"))
         self.genre_edit = QLineEdit()
-        form.addRow("Genre:", self._with_lookup(self.genre_edit, "genre", "Look up genre on Discogs"))
+        self.genre_edit.setPlaceholderText("Genre")
+        self.genre_edit.setClearButtonEnabled(True)
+        year_genre_layout.addWidget(self.genre_edit, 1)
+        year_genre_layout.addWidget(
+            self._lookup_button(
+                "genre",
+                "Fill Genre from the selected Discogs release (needs Artist, Album and Year)",
+            )
+        )
+        form.addRow("Year / Genre:", year_genre_box)
 
         self.disc_total_edit = QLineEdit("1")
-        form.addRow(
-            "Total Discs (CDs):",
-            self._with_lookup(self.disc_total_edit, "disc_total", "Look up the disc count on Discogs"),
-        )
+        self.disc_total_edit.setPlaceholderText("1")
+        self.disc_total_edit.setFixedWidth(70)
+        form.addRow("Total Discs:", self.disc_total_edit)
 
-        # Cover Art row
-        self.album_cover_widget = CoverPreviewWidget(size=120, theme=self.theme)
-        form.addRow("Cover Art:", self.album_cover_widget)
+        self.compilation_checkbox = QCheckBox("Compilation (Various Artists album)")
+        self.compilation_checkbox.toggled.connect(self._on_compilation_toggled)
+        self.compilation_checkbox.toggled.connect(self._on_album_fields_changed)
+        form.addRow("Compilation:", self.compilation_checkbox)
 
-        layout.addLayout(form)
-        layout.addStretch()
+        form_panel_layout.addLayout(form)
+        form_panel_layout.addStretch(1)
+        layout.addWidget(form_panel, 1)
 
-        # Connect text changes to trigger validation & live tab sync
+        cover_panel = QFrame()
+        cover_panel.setObjectName("editPanel")
+        cover_panel.setFixedWidth(430)
+        cover_layout = QVBoxLayout(cover_panel)
+        cover_layout.setContentsMargins(16, 14, 16, 14)
+        cover_layout.setSpacing(10)
+        cover_title = QLabel("Cover art")
+        cover_title.setObjectName("editSectionTitle")
+        cover_layout.addWidget(cover_title)
+        cover_hint = QLabel("Embedded artwork. Search online or pick a local image.")
+        cover_hint.setObjectName("editSubtle")
+        cover_hint.setWordWrap(True)
+        cover_layout.addWidget(cover_hint)
+        self.album_cover_widget = CoverPreviewWidget(size=140, theme=self.theme)
+        self.album_cover_widget.search_requested.connect(lambda: self._on_search_cover(False))
+        self.album_cover_widget.cover_changed.connect(lambda _action: self._update_cover_source(False))
+        cover_layout.addWidget(self.album_cover_widget)
+        self.album_cover_source = QLabel("No artwork loaded.")
+        self.album_cover_source.setObjectName("editSubtle")
+        self.album_cover_source.setWordWrap(True)
+        cover_layout.addWidget(self.album_cover_source)
+        cover_layout.addStretch(1)
+        note = QLabel("Searches Discogs. Uses Album, Artist and Year as anchors.")
+        note.setObjectName("editSubtle")
+        note.setWordWrap(True)
+        cover_layout.addWidget(note)
+        layout.addWidget(cover_panel, 0)
+
         self.album_edit.textChanged.connect(self._on_album_fields_changed)
         self.album_artist_edit.textChanged.connect(self._on_album_fields_changed)
         self.artist_edit.textChanged.connect(self._on_album_fields_changed)
         self.year_edit.textChanged.connect(self._on_album_fields_changed)
         self.genre_edit.textChanged.connect(self._on_album_fields_changed)
         self.disc_total_edit.textChanged.connect(self._on_album_fields_changed)
+        for editor in (
+            self.album_edit,
+            self.album_artist_edit,
+            self.artist_edit,
+            self.year_edit,
+            self.genre_edit,
+        ):
+            editor.textChanged.connect(self._update_field_search_buttons)
 
     def _setup_single_track_tab(self):
         layout = QHBoxLayout(self.tab_tracks)
-        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter)
 
-        # Left: List of tracks
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.left_title = QLabel("Album Tracks:")
-        title_col = "#57606a" if self.theme == "light" else "#8b949e"
-        self.left_title.setStyleSheet(f"font-weight: bold; color: {title_col};")
+        # Left: track list
+        left_panel = QFrame()
+        left_panel.setObjectName("editPanel")
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(8)
+        self.left_title = QLabel("Album Tracks")
+        self.left_title.setObjectName("editSectionTitle")
         left_layout.addWidget(self.left_title)
-
         self.track_list = QListWidget()
+        self.track_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.track_list.currentRowChanged.connect(self._on_track_selected)
-        left_layout.addWidget(self.track_list)
-        splitter.addWidget(left_widget)
+        left_layout.addWidget(self.track_list, 1)
+        splitter.addWidget(left_panel)
 
-        # Right: Single track edit form
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.right_title = QLabel("Edit Selected Track:")
-        self.right_title.setStyleSheet(f"font-weight: bold; color: {title_col};")
-        right_layout.addWidget(self.right_title)
+        # Middle: reference-style tag form
+        form_panel = QFrame()
+        form_panel.setObjectName("editPanel")
+        form_panel_layout = QVBoxLayout(form_panel)
+        form_panel_layout.setContentsMargins(16, 14, 16, 14)
+        form_panel_layout.setSpacing(10)
+        self.right_title = QLabel("Tags")
+        self.right_title.setObjectName("editSectionTitle")
+        form_panel_layout.addWidget(self.right_title)
+        self.st_hint = QLabel("Values are read from the file and written back on save.")
+        self.st_hint.setObjectName("editSubtle")
+        self.st_hint.setWordWrap(True)
+        form_panel_layout.addWidget(self.st_hint)
 
         form = QFormLayout()
-        form.setSpacing(8)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        # Disc fields
-        disc_layout = QHBoxLayout()
-        disc_layout.setSpacing(6)
-        self.st_disc_no = QLineEdit()
-        self.st_disc_no.setPlaceholderText("1")
-        self.st_disc_no.setFixedWidth(50)
-        self.st_disc_total = QLineEdit()
-        self.st_disc_total.setPlaceholderText("1")
-        self.st_disc_total.setFixedWidth(50)
-        disc_layout.addWidget(QLabel("Disc:"))
-        disc_layout.addWidget(
-            self._with_lookup(self.st_disc_no, "disc_no", "Look up the disc number on Discogs")
-        )
-        disc_layout.addWidget(QLabel("of"))
-        disc_layout.addWidget(self.st_disc_total)
-        disc_layout.addStretch()
-        form.addRow("Disc (CD):", disc_layout)
-
-        self.st_track_no = QLineEdit()
-        form.addRow(
-            "Track Number:",
-            self._with_lookup(self.st_track_no, "track_no", "Look up the track position on Discogs"),
-        )
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.st_title = QLineEdit()
-        form.addRow("Title:", self._with_lookup(self.st_title, "title", "Look up the track title on Discogs"))
+        self.st_title.setPlaceholderText("Track title")
+        form.addRow(
+            "Title:",
+            self._with_lookup(
+                self.st_title,
+                "title",
+                "Fill the track title from Discogs (needs Artist, Album, Year; uses Track number or the file name)",
+            ),
+        )
 
         self.st_artist = QLineEdit()
-        form.addRow("Artist:", self._with_lookup(self.st_artist, "artist", "Look up artist on Discogs"))
-
-        self.st_album_artist = QLineEdit()
+        self.st_artist.setPlaceholderText("Track artist")
         form.addRow(
-            "Album artist:",
-            self._with_lookup(self.st_album_artist, "album_artist", "Look up album artist on Discogs"),
+            "Artist:",
+            self._with_lookup(self.st_artist, "artist", "Find Artist on Discogs using Album + Year"),
         )
 
         self.st_album = QLineEdit()
-        form.addRow("Album:", self._with_lookup(self.st_album, "album", "Look up album title on Discogs"))
+        self.st_album.setPlaceholderText("Album title")
+        form.addRow(
+            "Album:",
+            self._with_lookup(self.st_album, "album", "Find Album on Discogs using Artist + Year"),
+        )
 
+        self.st_album_artist = QLineEdit()
+        self.st_album_artist.setPlaceholderText("Album artist")
+        form.addRow(
+            "Album artist:",
+            self._with_lookup(
+                self.st_album_artist,
+                "album_artist",
+                "Fill Album artist from the selected Discogs release",
+            ),
+        )
+
+        year_genre_box = QWidget()
+        year_genre_layout = QHBoxLayout(year_genre_box)
+        year_genre_layout.setContentsMargins(0, 0, 0, 0)
+        year_genre_layout.setSpacing(6)
         self.st_year = QLineEdit()
-        form.addRow("Year:", self._with_lookup(self.st_year, "year", "Look up year on Discogs"))
-
+        self.st_year.setPlaceholderText("e.g. 2005")
+        self.st_year.setFixedWidth(100)
+        year_genre_layout.addWidget(self.st_year)
+        year_genre_layout.addWidget(
+            self._lookup_button("year", "Find Year on Discogs using Artist + Album")
+        )
+        year_genre_layout.addSpacing(6)
+        year_genre_layout.addWidget(QLabel("Genre:"))
         self.st_genre = QLineEdit()
-        form.addRow("Genre:", self._with_lookup(self.st_genre, "genre", "Look up genre on Discogs"))
+        self.st_genre.setPlaceholderText("Genre")
+        year_genre_layout.addWidget(self.st_genre, 1)
+        year_genre_layout.addWidget(
+            self._lookup_button("genre", "Fill Genre from the selected Discogs release")
+        )
+        form.addRow("Year / Genre:", year_genre_box)
 
-        self.st_cover_widget = CoverPreviewWidget(size=100, theme=self.theme)
-        form.addRow("Cover Art:", self.st_cover_widget)
+        track_disc_box = QWidget()
+        track_disc_layout = QHBoxLayout(track_disc_box)
+        track_disc_layout.setContentsMargins(0, 0, 0, 0)
+        track_disc_layout.setSpacing(6)
+        self.st_track_no = QLineEdit()
+        self.st_track_no.setPlaceholderText("e.g. 01")
+        self.st_track_no.setFixedWidth(80)
+        track_disc_layout.addWidget(self.st_track_no)
+        track_disc_layout.addSpacing(8)
+        track_disc_layout.addWidget(QLabel("Disc:"))
+        self.st_disc_no = QLineEdit()
+        self.st_disc_no.setPlaceholderText("1")
+        self.st_disc_no.setFixedWidth(50)
+        track_disc_layout.addWidget(self.st_disc_no)
+        track_disc_layout.addWidget(QLabel("of"))
+        self.st_disc_total = QLineEdit()
+        self.st_disc_total.setPlaceholderText("1")
+        self.st_disc_total.setFixedWidth(50)
+        track_disc_layout.addWidget(self.st_disc_total)
+        track_disc_layout.addWidget(
+            self._lookup_button(
+                "track",
+                "Find Track and Disc number from the tagged Title (needs Artist, Album, Year and Title)",
+            )
+        )
+        track_disc_layout.addStretch(1)
+        form.addRow("Track / Disc:", track_disc_box)
 
-        right_layout.addLayout(form)
-        right_layout.addStretch()
-        splitter.addWidget(right_widget)
+        self.st_compilation = QCheckBox("Compilation (Various Artists album)")
+        self.st_compilation.toggled.connect(self._on_single_track_field_changed)
+        form.addRow("Compilation:", self.st_compilation)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        form_panel_layout.addLayout(form)
+        form_panel_layout.addStretch(1)
+        splitter.addWidget(form_panel)
 
-        # Connect live track changes
-        self.st_disc_no.textChanged.connect(self._on_single_track_field_changed)
-        self.st_disc_total.textChanged.connect(self._on_single_track_field_changed)
-        self.st_track_no.textChanged.connect(self._on_single_track_field_changed)
-        self.st_title.textChanged.connect(self._on_single_track_field_changed)
-        self.st_artist.textChanged.connect(self._on_single_track_field_changed)
-        self.st_album_artist.textChanged.connect(self._on_single_track_field_changed)
-        self.st_album.textChanged.connect(self._on_single_track_field_changed)
-        self.st_year.textChanged.connect(self._on_single_track_field_changed)
-        self.st_genre.textChanged.connect(self._on_single_track_field_changed)
+        # Right: cover panel
+        cover_panel = QFrame()
+        cover_panel.setObjectName("editPanel")
+        cover_panel.setFixedWidth(410)
+        cover_layout = QVBoxLayout(cover_panel)
+        cover_layout.setContentsMargins(14, 14, 14, 14)
+        cover_layout.setSpacing(10)
+        cover_title = QLabel("Cover art")
+        cover_title.setObjectName("editSectionTitle")
+        cover_layout.addWidget(cover_title)
+        cover_hint = QLabel("Artwork embedded in this track.")
+        cover_hint.setObjectName("editSubtle")
+        cover_hint.setWordWrap(True)
+        cover_layout.addWidget(cover_hint)
+        self.st_cover_widget = CoverPreviewWidget(size=140, theme=self.theme)
+        self.st_cover_widget.search_requested.connect(lambda: self._on_search_cover(True))
+        self.st_cover_widget.cover_changed.connect(lambda _action: self._update_cover_source(True))
+        cover_layout.addWidget(self.st_cover_widget)
+        self.st_cover_source = QLabel("No artwork loaded.")
+        self.st_cover_source.setObjectName("editSubtle")
+        self.st_cover_source.setWordWrap(True)
+        cover_layout.addWidget(self.st_cover_source)
+        cover_layout.addStretch(1)
+        note = QLabel("Searches Discogs. Uses Album, Artist and Year as anchors.")
+        note.setObjectName("editSubtle")
+        note.setWordWrap(True)
+        cover_layout.addWidget(note)
+        splitter.addWidget(cover_panel)
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([230, 530, 410])
+
+        for editor in (
+            self.st_disc_no,
+            self.st_disc_total,
+            self.st_track_no,
+            self.st_title,
+            self.st_artist,
+            self.st_album,
+            self.st_album_artist,
+            self.st_year,
+            self.st_genre,
+        ):
+            editor.textChanged.connect(self._on_single_track_field_changed)
+            editor.textChanged.connect(self._update_field_search_buttons)
 
     def _populate_initial_data(self):
         if not self.tracks:
@@ -830,11 +1047,13 @@ class BaseAlbumEditDialog(QDialog):
 
         if sample_cover and Path(sample_cover).exists():
             self.album_cover_widget.set_original_cover(sample_cover)
+        self._update_cover_source(False)
 
         # Populate track list
         self._refresh_track_list()
         if self.tracks:
             self.track_list.setCurrentRow(0)
+        self._update_field_search_buttons()
 
     def _refresh_track_list(self):
         curr_row = self.track_list.currentRow()
@@ -855,6 +1074,20 @@ class BaseAlbumEditDialog(QDialog):
         self.track_list.blockSignals(False)
         if 0 <= curr_row < len(self.tracks):
             self.track_list.setCurrentRow(curr_row)
+
+    def _update_cover_source(self, single: bool = False):
+        widget = self.st_cover_widget if single else getattr(self, "album_cover_widget", None)
+        label = self.st_cover_source if single else getattr(self, "album_cover_source", None)
+        if widget is None or label is None:
+            return
+        if widget.action == "delete":
+            label.setText("Artwork will be removed on save.")
+        elif widget.action == "new":
+            label.setText("New artwork selected — it will be embedded on save.")
+        elif widget.original_image_path:
+            label.setText("Artwork embedded in the file.")
+        else:
+            label.setText("No artwork loaded.")
 
     def _on_compilation_toggled(self, checked: bool):
         if checked:
@@ -899,9 +1132,13 @@ class BaseAlbumEditDialog(QDialog):
             self.st_year.setText(t.get("year", "") if t.get("year") != NO_DATA else "")
             self.st_genre.setText(t.get("genre", "") if t.get("genre") != NO_DATA else "")
             self.st_disc_total.setText(str(t.get("disc_total", "1")))
+            self.st_compilation.blockSignals(True)
+            self.st_compilation.setChecked(int(t.get("compilation") or 0) == 1)
+            self.st_compilation.blockSignals(False)
             for w in widgets:
                 w.blockSignals(False)
 
+        self._update_field_search_buttons()
         self._validate_readiness()
 
     def _on_tab_changed(self, new_index: int):
@@ -913,6 +1150,7 @@ class BaseAlbumEditDialog(QDialog):
         else:
             # Switched to album edit: save any single track edits
             self._save_current_single_track_form()
+        self._update_field_search_buttons()
 
     def _on_track_selected(self, index: int):
         if index < 0 or index >= len(self.tracks):
@@ -929,7 +1167,8 @@ class BaseAlbumEditDialog(QDialog):
         # Block signals to avoid feedback loops
         widgets = [
             self.st_disc_no, self.st_disc_total, self.st_track_no, self.st_title,
-            self.st_artist, self.st_album_artist, self.st_album, self.st_year, self.st_genre
+            self.st_artist, self.st_album_artist, self.st_album, self.st_year, self.st_genre,
+            self.st_compilation,
         ]
         for w in widgets:
             w.blockSignals(True)
@@ -943,6 +1182,7 @@ class BaseAlbumEditDialog(QDialog):
         self.st_album.setText(t.get("album", "") if t.get("album") != NO_DATA else "")
         self.st_year.setText(t.get("year", "") if t.get("year") != NO_DATA else "")
         self.st_genre.setText(t.get("genre", "") if t.get("genre") != NO_DATA else "")
+        self.st_compilation.setChecked(int(t.get("compilation") or 0) == 1)
 
         for w in widgets:
             w.blockSignals(False)
@@ -957,6 +1197,7 @@ class BaseAlbumEditDialog(QDialog):
         elif t.get("_cover_action") == "delete":
             self.st_cover_widget.action = "delete"
             self.st_cover_widget._update_preview()
+        self._update_cover_source(True)
 
     def _on_single_track_field_changed(self):
         row = self.current_single_track_idx
@@ -973,6 +1214,7 @@ class BaseAlbumEditDialog(QDialog):
         t["album"] = self.st_album.text().strip() or NO_DATA
         t["year"] = self.st_year.text().strip() or NO_DATA
         t["genre"] = self.st_genre.text().strip() or NO_DATA
+        t["compilation"] = 1 if self.st_compilation.isChecked() else 0
 
         # Update left list item
         discs = {str(item.get("disc_no", "1")).strip() for item in self.tracks if item.get("disc_no")}
@@ -982,6 +1224,7 @@ class BaseAlbumEditDialog(QDialog):
         if item:
             item.setText(f"{prefix}{t['track_no']}. {t['title']}")
 
+        self._update_field_search_buttons()
         self._validate_readiness()
 
     def _save_current_single_track_form(self):
@@ -997,15 +1240,30 @@ class BaseAlbumEditDialog(QDialog):
             t["album"] = self.st_album.text().strip() or NO_DATA
             t["year"] = self.st_year.text().strip() or NO_DATA
             t["genre"] = self.st_genre.text().strip() or NO_DATA
+            t["compilation"] = 1 if self.st_compilation.isChecked() else 0
 
             # Cover changes
             t["_cover_action"] = self.st_cover_widget.action
             t["_new_cover_path"] = self.st_cover_widget.new_image_path
 
-    def _discogs_context(self, single: bool) -> Dict[str, str]:
+    # ------------------------------------------------------------------
+    # Discogs metadata lookup (one field at a time, as in CoverArtTagger)
+    # ------------------------------------------------------------------
+    METADATA_LABELS = {
+        "artist": "Artist",
+        "album": "Album",
+        "year": "Year",
+        "title": "Title",
+        "genre": "Genre",
+        "album_artist": "Album artist",
+        "track": "Track number",
+    }
+
+    def _is_single(self) -> bool:
+        return self.tabs.currentIndex() == 1
+
+    def _context_values(self, single: bool) -> Dict[str, str]:
         if single:
-            row = self.current_single_track_idx
-            track = self.tracks[row] if 0 <= row < len(self.tracks) else {}
             return {
                 "album": self.st_album.text().strip(),
                 "album_artist": self.st_album_artist.text().strip(),
@@ -1013,9 +1271,6 @@ class BaseAlbumEditDialog(QDialog):
                 "year": self.st_year.text().strip(),
                 "genre": self.st_genre.text().strip(),
                 "title": self.st_title.text().strip(),
-                "track_no": self.st_track_no.text().strip(),
-                "disc_no": self.st_disc_no.text().strip(),
-                "file_path": str(track.get("file_path", "")),
             }
         return {
             "album": self.album_edit.text().strip(),
@@ -1023,90 +1278,570 @@ class BaseAlbumEditDialog(QDialog):
             "artist": self.artist_edit.text().strip(),
             "year": self.year_edit.text().strip(),
             "genre": self.genre_edit.text().strip(),
-            "disc_total": self.disc_total_edit.text().strip(),
         }
 
-    def _on_discogs_field(self, field: str):
-        single = self.tabs.currentIndex() == 1
-        self._open_discogs(single=single, field=field)
-
-    def _on_discogs_search(self):
-        self._open_discogs(single=self.tabs.currentIndex() == 1, field="")
-
-    def _open_discogs(self, single: bool, field: str = ""):
-        from malka.ui.discogs_dialog import DiscogsDialog
-
-        ctx = self._discogs_context(single)
-        dialog = DiscogsDialog(
-            album=ctx.get("album", ""),
-            artist=ctx.get("artist") or ctx.get("album_artist", ""),
-            year=ctx.get("year", ""),
-            theme=self.theme,
-            parent=self,
-            mode="field" if field else ("track" if single else "all"),
-            field=field,
-            track_title=ctx.get("title", ""),
-            track_no=ctx.get("track_no", ""),
-            disc_no=ctx.get("disc_no", ""),
-            file_path=ctx.get("file_path", ""),
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._apply_discogs_values(dialog.metadata, dialog.cover_path, single, field)
-
-    def _apply_discogs_values(
-        self,
-        values: Dict[str, str],
-        cover_path: str,
-        single: bool,
-        field: str = "",
-    ):
+    def _field_edit(self, field: str, single: bool):
         if single:
-            widgets = {
-                "album": self.st_album,
-                "album_artist": self.st_album_artist,
+            return {
                 "artist": self.st_artist,
+                "album": self.st_album,
                 "year": self.st_year,
-                "genre": self.st_genre,
                 "title": self.st_title,
-                "track_no": self.st_track_no,
-                "disc_no": self.st_disc_no,
-            }
-            targets = widgets
-        else:
-            widgets = {
-                "album": self.album_edit,
-                "album_artist": self.album_artist_edit,
-                "artist": self.artist_edit,
-                "year": self.year_edit,
-                "genre": self.genre_edit,
-                "disc_total": self.disc_total_edit,
-            }
-            targets = widgets
-        selected = {field: values.get(field, "")} if field else values
-        for key, value in selected.items():
-            edit = targets.get(key)
-            if edit is None or value is None:
-                continue
-            edit.blockSignals(True)
-            edit.setText(str(value))
-            edit.blockSignals(False)
+                "genre": self.st_genre,
+                "album_artist": self.st_album_artist,
+            }.get(field)
+        return {
+            "artist": self.artist_edit,
+            "album": self.album_edit,
+            "year": self.year_edit,
+            "genre": self.genre_edit,
+            "album_artist": self.album_artist_edit,
+        }.get(field)
 
-        if single:
-            self._on_single_track_field_changed()
-            if cover_path:
-                self.st_cover_widget.action = "new"
-                self.st_cover_widget.new_image_path = cover_path
-                self.st_cover_widget._update_preview()
-                self.st_cover_widget.cover_changed.emit("new")
+    def _metadata_requirement(self, field: str, single: bool) -> str:
+        ctx = self._context_values(single)
+        artist, album, year = bool(ctx["artist"]), bool(ctx["album"]), bool(ctx["year"])
+        if field == "artist":
+            return "" if album and year else "Fill Album and Year first."
+        if field == "album":
+            return "" if artist and year else "Fill Artist and Year first."
+        if field == "year":
+            return "" if artist and album else "Fill Artist and Album first."
+        if field in ("title", "genre", "album_artist", "track"):
+            if not (artist and album and year):
+                return "Fill Artist, Album and Year first."
+            if field == "track" and not ctx.get("title", ""):
+                return "Fill Title first."
+            return ""
+        return "Unknown field."
+
+    def _update_field_search_buttons(self, *args):
+        single = self._is_single()
+        busy = bool(self._metadata_worker and self._metadata_worker.isRunning())
+        for field, buttons in self._field_buttons.items():
+            requirement = self._metadata_requirement(field, single)
+            for button in buttons:
+                button.setEnabled(not requirement and not busy)
+        ctx = self._context_values(single)
+        if hasattr(self, "album_cover_widget"):
+            self.album_cover_widget.set_controls_enabled(True, bool(ctx["album"]))
+        if hasattr(self, "st_cover_widget"):
+            self.st_cover_widget.set_controls_enabled(True, bool(ctx["album"]))
+
+    @staticmethod
+    def _norm_meta(value: str) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    def _matching_metadata_candidate(self, single: bool):
+        candidate = self._metadata_candidate
+        if candidate is None:
+            return None
+        ctx = self._context_values(single)
+        if self._norm_meta(candidate.artist) != self._norm_meta(ctx["artist"]):
+            return None
+        if self._norm_meta(candidate.title) != self._norm_meta(ctx["album"]):
+            return None
+        if self._norm_meta(candidate.year) != self._norm_meta(ctx["year"]):
+            return None
+        return candidate
+
+    def _set_status(self, text: str, kind: str = "info"):
+        light = self.theme == "light"
+        colors = {
+            "info": "#656d76" if light else "#8b949e",
+            "ok": "#1a7f37" if light else "#3fb950",
+            "warn": "#9a6700" if light else "#d29922",
+            "error": "#cf222e" if light else "#f85149",
+        }
+        self.status_lbl.setText(text)
+        self.status_lbl.setStyleSheet(
+            f"color:{colors.get(kind, colors['info'])}; font-size:12px; font-weight:500;"
+        )
+
+    def _on_field_lookup(self, field: str):
+        single = self._is_single()
+        requirement = self._metadata_requirement(field, single)
+        if requirement:
+            QMessageBox.information(self, "Not enough information", requirement)
+            return
+        if self._metadata_worker is not None and self._metadata_worker.isRunning():
+            return
+
+        ctx = self._context_values(single)
+        if field in ("title", "genre", "album_artist", "track"):
+            candidate = self._matching_metadata_candidate(single)
+            if candidate is not None:
+                self._apply_metadata_value(field, candidate, single)
+                return
+
+        from malka.ui.discogs_dialogs import DiscogsBusyDialog
+        from malka.ui.discogs_workers import DiscogsMetadataWorker
+
+        self._metadata_target_field = field
+        self._metadata_single = single
+        self._metadata_canceled = False
+        worker = DiscogsMetadataWorker(ctx["artist"], ctx["album"], ctx["year"], self)
+        worker.progress.connect(self._on_metadata_progress)
+        worker.succeeded.connect(self._on_metadata_succeeded)
+        worker.failed.connect(self._on_metadata_failed)
+        worker.finished.connect(self._on_metadata_finished)
+        self._metadata_worker = worker
+        self._metadata_dialog = DiscogsBusyDialog(
+            "Looking up metadata",
+            f'Searching Discogs for “{ctx["album"] or ctx["artist"]}”…',
+            self,
+            theme=self.theme,
+        )
+        self._metadata_dialog.canceled.connect(self._cancel_metadata_lookup)
+        self._metadata_dialog.show()
+        worker.start()
+        self._update_field_search_buttons()
+        self._set_status("Looking up release metadata on Discogs…", "info")
+
+    def _on_metadata_progress(self, message: str):
+        if self._metadata_dialog is not None:
+            self._metadata_dialog.set_message(message)
+        self._set_status(message[:110], "info")
+
+    def _on_metadata_succeeded(self, candidates):
+        if self._metadata_canceled:
+            return
+        self._close_metadata_dialog()
+        if not candidates:
+            self._set_status("No matching Discogs releases found.", "warn")
+            QMessageBox.information(
+                self,
+                "Nothing found",
+                "Discogs did not return a matching release. Check Artist, Album and Year — "
+                "or add a Discogs token in Settings if the API is rate-limiting.",
+            )
+            return
+        selected = candidates[0] if len(candidates) == 1 else self._pick_release(candidates)
+        if selected is None:
+            self._set_status("Metadata lookup cancelled.", "info")
+            return
+        self._metadata_candidate = selected
+        self._apply_metadata_value(
+            self._metadata_target_field, selected, self._metadata_single
+        )
+        self._update_field_search_buttons()
+
+    def _on_metadata_failed(self, message: str):
+        if self._metadata_canceled:
+            return
+        self._close_metadata_dialog()
+        self._set_status("Metadata lookup failed.", "error")
+        QMessageBox.warning(self, "Lookup failed", message)
+
+    def _cancel_metadata_lookup(self):
+        if self._metadata_worker is None:
+            return
+        self._metadata_canceled = True
+        self._metadata_worker.requestInterruption()
+        if self._metadata_dialog is not None:
+            self._metadata_dialog.set_message("Cancelling the lookup…")
+            self._metadata_dialog.btn_cancel.setEnabled(False)
+        self._set_status("Cancelling metadata lookup…", "info")
+
+    def _on_metadata_finished(self):
+        self._close_metadata_dialog()
+        worker = self._metadata_worker
+        self._metadata_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._update_field_search_buttons()
+        if self._metadata_canceled:
+            self._set_status("Metadata lookup cancelled.", "info")
+
+    def _close_metadata_dialog(self):
+        if self._metadata_dialog is not None:
+            dialog = self._metadata_dialog
+            self._metadata_dialog = None
+            dialog.accept()
+            dialog.deleteLater()
+
+    def _pick_release(self, candidates):
+        from malka.ui.discogs_dialogs import DiscogsChoiceDialog
+
+        entries = []
+        for candidate in candidates:
+            display = candidate.display_title
+            if candidate.display_detail:
+                display += f" · {candidate.display_detail}"
+            entries.append((display, candidate.tooltip, candidate))
+        dialog = DiscogsChoiceDialog(
+            "Choose release",
+            "Several Discogs releases match. Pick the release to use.",
+            entries,
+            self,
+            theme=self.theme,
+            select_label="Use this release",
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            value = dialog.selected_value()
+            return value if value is not None else None
+        return None
+
+    def _pick_track(self, tracks, subtitle: str):
+        from malka.ui.discogs_dialogs import DiscogsChoiceDialog
+
+        entries = [(track.display, track.tooltip, track) for track in tracks]
+        dialog = DiscogsChoiceDialog(
+            "Choose track",
+            subtitle,
+            entries,
+            self,
+            theme=self.theme,
+            select_label="Use this track",
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            return dialog.selected_value()
+        return None
+
+    def _pick_value(self, title: str, values: List[str]):
+        from malka.ui.discogs_dialogs import DiscogsChoiceDialog
+
+        entries = [(value, value, value) for value in values]
+        dialog = DiscogsChoiceDialog(
+            title,
+            "Discogs lists several values. Pick the one to use.",
+            entries,
+            self,
+            theme=self.theme,
+            select_label="Use this value",
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            value = dialog.selected_value()
+            return str(value) if value else None
+        return None
+
+    def _apply_metadata_value(self, field: str, candidate, single: bool):
+        label = self.METADATA_LABELS.get(field, field.title())
+        value = ""
+        status_extra = ""
+        if field == "track":
+            self._apply_track_number(candidate, single)
+            return
+        if field == "artist":
+            value = candidate.artist
+        elif field == "album":
+            value = candidate.title
+        elif field == "year":
+            value = candidate.year
+        elif field == "album_artist":
+            value = candidate.artist
+        elif field == "genre":
+            genres = candidate.genre_values
+            if not genres:
+                QMessageBox.information(
+                    self,
+                    "No genre found",
+                    "Discogs did not provide a genre or style for this release.",
+                )
+                return
+            if len(genres) == 1:
+                value = genres[0]
+            else:
+                selected = self._pick_value("Choose genre", genres)
+                if selected is None:
+                    return
+                value = selected
+        elif field == "title":
+            track = self._resolve_track(candidate, single)
+            if track is None:
+                return
+            value = track.title
+            if track.position:
+                status_extra = f" (track {track.position})"
         else:
-            self._on_album_fields_changed()
-            if cover_path:
-                self.album_cover_widget.action = "new"
-                self.album_cover_widget.new_image_path = cover_path
-                self.album_cover_widget._update_preview()
-                self.album_cover_widget.cover_changed.emit("new")
-        self._validate_readiness()
+            return
+        if not value:
+            QMessageBox.information(
+                self,
+                "No value found",
+                f"Discogs did not provide a value for {label}.",
+            )
+            return
+        edit = self._field_edit(field, single)
+        if edit is None:
+            return
+        edit.setText(value)
+        edit.setFocus()
+        self._set_status(
+            f"{label} filled from Discogs: “{value[:80]}”{status_extra}.", "ok"
+        )
+        self._update_field_search_buttons()
+
+    def _apply_track_number(self, candidate, single: bool):
+        track = self._resolve_track_by_title(candidate, single)
+        if track is None:
+            return
+        track_no = track.track_no.strip()
+        if not track_no:
+            QMessageBox.information(
+                self,
+                "No track number",
+                f'Discogs position “{track.position}” does not contain a numeric track number.',
+            )
+            return
+        if single:
+            self.st_track_no.setText(track_no)
+            if track.disc_no:
+                self.st_disc_no.setText(track.disc_no)
+        else:
+            # Album-level dialog has no track number field; this lookup is only
+            # exposed on the single-track tab.
+            return
+        disc_text = f", disc {track.disc_no}" if track.disc_no else ""
+        self._set_status(
+            f"Track number filled from Discogs: {track_no}{disc_text} — "
+            f"“{track.title[:60]}”.",
+            "ok",
+        )
+        self._update_field_search_buttons()
+
+    def _resolve_track_by_title(self, candidate, single: bool):
+        from malka.discogs_metadata import rank_tracks_by_title
+
+        if not candidate.tracks:
+            QMessageBox.information(
+                self, "No tracklist", "Discogs did not return a tracklist for this release."
+            )
+            return None
+        title = self.st_title.text().strip() if single else ""
+        ranked = rank_tracks_by_title(candidate, title)
+        if not ranked:
+            QMessageBox.information(
+                self,
+                "Track not found",
+                f"Could not find “{title}” in the Discogs tracklist.",
+            )
+            return None
+        best_score, best_track = ranked[0]
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        if len(ranked) == 1 or (
+            best_score >= 0.82 and best_score - second_score >= 0.08
+        ):
+            return best_track
+        choices = [track for score, track in ranked if score >= 0.45][:12]
+        if not choices:
+            choices = candidate.tracks
+        return self._pick_track(
+            choices,
+            f"Could not match “{title}” unambiguously. Pick the track:",
+        )
+
+    def _resolve_track(self, candidate, single: bool):
+        from malka.discogs_metadata import (
+            rank_tracks_by_filename,
+            rank_tracks_by_title,
+            tracks_by_number,
+        )
+
+        if not candidate.tracks:
+            QMessageBox.information(
+                self, "No tracklist", "Discogs did not return a tracklist for this release."
+            )
+            return None
+        if not single:
+            return None
+        track_no = self.st_track_no.text().strip()
+        disc_no = self.st_disc_no.text().strip()
+        if track_no:
+            matches = tracks_by_number(candidate, track_no, disc_no)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                return self._pick_track(
+                    matches,
+                    "Several tracks have this number. Pick the right one.",
+                )
+        row = self.current_single_track_idx
+        file_path = (
+            self.tracks[row].get("file_path", "")
+            if 0 <= row < len(self.tracks)
+            else ""
+        )
+        if file_path:
+            ranked = rank_tracks_by_filename(
+                candidate,
+                Path(file_path).name,
+                self.st_artist.text().strip(),
+                self.st_album.text().strip(),
+            )
+            if ranked:
+                best_score, best_track = ranked[0]
+                second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+                if best_score >= 0.60 and (
+                    len(ranked) == 1 or best_score - second_score >= 0.08
+                ):
+                    return best_track
+                choices = [track for score, track in ranked if score > 0][:12]
+                if not choices:
+                    choices = candidate.tracks
+                return self._pick_track(
+                    choices,
+                    "Could not determine the track unambiguously from the file name. "
+                    "Pick the track:",
+                )
+        return self._pick_track(
+            candidate.tracks,
+            f"Pick the track for {candidate.display_title}:",
+        )
+
+    # ------------------------------------------------------------------
+    # Discogs cover search (separate from metadata lookup)
+    # ------------------------------------------------------------------
+    def _on_search_cover(self, single: bool):
+        ctx = self._context_values(single)
+        album = ctx["album"]
+        if not album:
+            QMessageBox.information(
+                self,
+                "Album title required",
+                "Fill in the Album field first — the cover search uses it as its query.",
+            )
+            (self.st_album if single else self.album_edit).setFocus()
+            return
+        if self._search_worker is not None and self._search_worker.isRunning():
+            return
+        artist = ctx["album_artist"] or ctx["artist"]
+        if artist.lower() in ("various artists", "va") and ctx["artist"]:
+            artist = ctx["artist"]
+        year = ctx["year"]
+        self._search_canceled = False
+        from malka.ui.discogs_dialogs import DiscogsBusyDialog
+        from malka.ui.discogs_workers import DiscogsCoverWorker
+
+        worker = DiscogsCoverWorker(album, artist, year, self)
+        worker.progress.connect(self._on_search_progress)
+        worker.succeeded.connect(self._on_search_succeeded)
+        worker.failed.connect(self._on_search_failed)
+        worker.finished.connect(self._on_search_finished)
+        self._search_worker = worker
+        self._search_single = single
+        self._search_dialog = DiscogsBusyDialog(
+            "Searching for cover art",
+            f'Looking for “{album}” on Discogs…',
+            self,
+            theme=self.theme,
+        )
+        self._search_dialog.canceled.connect(self._cancel_search)
+        self._search_dialog.show()
+        worker.start()
+        self._set_status(f'Searching cover art for “{album[:60]}”…', "info")
+
+    def _on_search_progress(self, message: str):
+        if self._search_dialog is not None:
+            self._search_dialog.set_message(message)
+        self._set_status(message[:110], "info")
+
+    def _on_search_succeeded(self, result):
+        if self._search_canceled:
+            return
+        self._close_search_dialog()
+        if not result.images:
+            self._set_status("No cover art found.", "warn")
+            QMessageBox.information(
+                self,
+                "No cover art found",
+                f'No cover images were found for “{result.album}”.\n\n'
+                "Check the Album field or add the album artist for a more precise match.",
+            )
+            return
+        from malka.ui.discogs_dialogs import DiscogsGalleryDialog
+
+        self._set_status(
+            f"Found {len(result.images)} cover image(s). Choose one.", "info"
+        )
+        gallery = DiscogsGalleryDialog(
+            result.images, result.album, result.artist, self.theme, self
+        )
+        if gallery.exec() == QDialog.DialogCode.Accepted:
+            image = gallery.selected_image()
+            if image is not None:
+                self._apply_artwork(
+                    image, gallery.selected_resize_size(), self._search_single
+                )
+        else:
+            self._set_status("No artwork selected.", "info")
+
+    def _on_search_failed(self, message: str):
+        if self._search_canceled:
+            return
+        self._close_search_dialog()
+        self._set_status("Cover search failed.", "error")
+        QMessageBox.warning(self, "Search failed", message)
+
+    def _cancel_search(self):
+        if self._search_worker is None:
+            return
+        self._search_canceled = True
+        self._search_worker.requestInterruption()
+        if self._search_dialog is not None:
+            self._search_dialog.set_message("Cancelling the search…")
+            self._search_dialog.btn_cancel.setEnabled(False)
+        self._set_status("Cancelling search…", "info")
+
+    def _on_search_finished(self):
+        self._close_search_dialog()
+        worker = self._search_worker
+        self._search_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self._search_canceled:
+            self._set_status("Cover search cancelled.", "info")
+
+    def _close_search_dialog(self):
+        if self._search_dialog is not None:
+            dialog = self._search_dialog
+            self._search_dialog = None
+            dialog.accept()
+            dialog.deleteLater()
+
+    def _apply_artwork(self, image, target_size: Optional[int], single: bool):
+        if not image.thumbnail:
+            QMessageBox.warning(
+                self, "Artwork unavailable", "This image has no downloaded preview."
+            )
+            return
+        from malka.discogs_imaging import prepare_artwork
+        from malka.tags import save_cover_cache
+
+        try:
+            prepared = prepare_artwork(image.thumbnail, target_size)
+            path = save_cover_cache(prepared.data, prepared.extension)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Could not prepare artwork", f"Failed to prepare the image:\n{exc}"
+            )
+            return
+        if not path:
+            QMessageBox.warning(self, "Could not cache artwork", "Failed to save the image.")
+            return
+        widget = self.st_cover_widget if single else self.album_cover_widget
+        widget.action = "new"
+        widget.new_image_path = path
+        widget._update_preview()
+        widget.btn_delete.setEnabled(True)
+        widget.cover_changed.emit("new")
+        self._update_cover_source(single)
+        self._set_status("Cover art selected. It will be embedded on save.", "ok")
+
+    def _on_reload(self):
+        reply = QMessageBox.question(
+            self,
+            "Reload tags",
+            "Discard all edits and reload the original tag values?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.tracks = [dict(t) for t in self._initial_tracks]
+        self.current_single_track_idx = -1
+        self._populate_initial_data()
+        self._set_status("Tags reloaded from the editor snapshot.", "info")
 
     def _validate_readiness(self) -> bool:
         # Check readiness for organization / import

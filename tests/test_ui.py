@@ -25,6 +25,7 @@ from malka.db import (
 from malka.tags import write_tags
 from malka.ui.album_card import AlbumCard
 from malka.ui.artist_card import ArtistCard
+from malka.discogs_metadata import ReleaseCandidate
 from malka.ui.edit_dialog import EditAlbumDialog
 from malka.ui.genre_card import GenreCard
 from malka.ui.main_window import MainWindow
@@ -457,6 +458,32 @@ class TestMalkaUI(unittest.TestCase):
                 get_cached_square_pixmap(self.cover_file, size=170, radius_top=8),
                 pix1,
             )
+
+
+    def test_discogs_field_lookup_changes_only_requested_field(self):
+        dialog = EditAlbumDialog("Masterpiece", "Artist X", self.conn, theme="dark")
+        try:
+            album_before = dialog.album_edit.text()
+            year_before = dialog.year_edit.text()
+            candidate = ReleaseCandidate(
+                id="1",
+                entity="master",
+                title="Another Album",
+                artist="Another Artist",
+                year="1999",
+                genres=["Rock"],
+            )
+            dialog._apply_metadata_value("artist", candidate, False)
+            self.assertEqual(dialog.artist_edit.text(), "Another Artist")
+            self.assertEqual(dialog.album_edit.text(), album_before)
+            self.assertEqual(dialog.year_edit.text(), year_before)
+
+            artist_before = dialog.artist_edit.text()
+            dialog._apply_metadata_value("album", candidate, False)
+            self.assertEqual(dialog.album_edit.text(), "Another Album")
+            self.assertEqual(dialog.artist_edit.text(), artist_before)
+        finally:
+            dialog.close()
 
 
 if __name__ == "__main__":
