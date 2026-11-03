@@ -53,6 +53,7 @@ class Config:
         self.db_path: str = str(DEFAULT_DB_PATH)
         self.audio_device_id: str = ""
         self.theme: str = "dark"
+        self.discogs_token: str = ""
         self.show_scrollbars: bool = True
         self.show_organize_badge: bool = True
         self.show_encoding_badge: bool = True
@@ -201,6 +202,7 @@ class Config:
                         self.db_path = saved_db
                     self.audio_device_id = data.get("audio_device_id", "")
                     self.theme = data.get("theme", "dark")
+                    self.discogs_token = str(data.get("discogs_token", "") or "")
                     self.show_scrollbars = data.get("show_scrollbars", True)
                     self.show_organize_badge = bool(data.get("show_organize_badge", True))
                     self.show_encoding_badge = bool(data.get("show_encoding_badge", True))
@@ -273,6 +275,7 @@ class Config:
             "db_path": self.db_path,
             "audio_device_id": self.audio_device_id,
             "theme": self.theme,
+            "discogs_token": self.discogs_token,
             "show_scrollbars": self.show_scrollbars,
             "show_organize_badge": self.show_organize_badge,
             "show_encoding_badge": self.show_encoding_badge,

@@ -355,6 +355,17 @@ class SettingsDialog(QDialog):
         self.scrollbars_checkbox.setChecked(getattr(config, "show_scrollbars", True))
         appearance_form.addRow("Scrollbars:", self.scrollbars_checkbox)
 
+        self.discogs_token_edit = QLineEdit(getattr(config, "discogs_token", ""))
+        self.discogs_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.discogs_token_edit.setPlaceholderText(
+            "Optional personal access token (DISCOGS_TOKEN)"
+        )
+        self.discogs_token_edit.setToolTip(
+            "A Discogs personal access token raises the API rate limit. "
+            "Create one in Discogs → Settings → Developers."
+        )
+        appearance_form.addRow("Discogs token:", self.discogs_token_edit)
+
         badges_widget = QWidget()
         badges_layout = QVBoxLayout(badges_widget)
         badges_layout.setContentsMargins(0, 0, 0, 0)
@@ -476,6 +487,7 @@ class SettingsDialog(QDialog):
         config.set_library_paths(paths)
         config.track_naming_format = new_tmpl
         config.theme = self.theme_combo.currentText().lower()
+        config.discogs_token = self.discogs_token_edit.text().strip()
         config.show_scrollbars = self.scrollbars_checkbox.isChecked()
         config.show_organize_badge = self.organize_badge_checkbox.isChecked()
         config.show_encoding_badge = self.encoding_badge_checkbox.isChecked()
