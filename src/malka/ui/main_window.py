@@ -399,6 +399,9 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.apply_theme(self.theme)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
         # Handle first launch check
         if check_first_launch:
@@ -2700,7 +2703,46 @@ class MainWindow(QMainWindow):
         # Ramp in over the first 40 px of scrolling so the resting grid stays clean.
         fade.set_strength(min(1.0, max(0, int(scroll_value)) / 40.0))
 
+    @staticmethod
+    def _is_resize_cursor(shape) -> bool:
+        return shape in (
+            Qt.CursorShape.SizeHorCursor,
+            Qt.CursorShape.SizeVerCursor,
+            Qt.CursorShape.SizeFDiagCursor,
+            Qt.CursorShape.SizeBDiagCursor,
+        )
+
+    def _set_resize_cursor_for_edge(self, edge):
+        if not edge:
+            if self._is_resize_cursor(self.cursor().shape()):
+                self.unsetCursor()
+            return
+        if edge in (Qt.Edge.LeftEdge, Qt.Edge.RightEdge):
+            shape = Qt.CursorShape.SizeHorCursor
+        elif edge in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge):
+            shape = Qt.CursorShape.SizeVerCursor
+        elif edge == (Qt.Edge.TopEdge | Qt.Edge.LeftEdge) or edge == (
+            Qt.Edge.BottomEdge | Qt.Edge.RightEdge
+        ):
+            shape = Qt.CursorShape.SizeFDiagCursor
+        else:
+            shape = Qt.CursorShape.SizeBDiagCursor
+        if self.cursor().shape() != shape:
+            self.setCursor(shape)
+
     def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseMove and self.isVisible():
+            # Child widgets receive mouse moves without notifying the window.
+            # Watch globally so a resize cursor can never remain stuck after
+            # the pointer leaves an edge or moves over a child control.
+            try:
+                local = self.mapFromGlobal(event.globalPosition().toPoint())
+            except Exception:
+                local = None
+            if local is not None and self.rect().contains(local):
+                self._set_resize_cursor_for_edge(self._get_resize_edge(local))
+            elif self._is_resize_cursor(self.cursor().shape()):
+                self.unsetCursor()
         if event.type() == QEvent.Type.Resize:
             fade = getattr(self, "_scroll_fades", {}).get(obj)
             if fade is not None:
@@ -3699,26 +3741,34 @@ class MainWindow(QMainWindow):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        edge = self._get_resize_edge(event.pos())
-        if edge == Qt.Edge.LeftEdge or edge == Qt.Edge.RightEdge:
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
-        elif edge == Qt.Edge.TopEdge or edge == Qt.Edge.BottomEdge:
-            self.setCursor(Qt.CursorShape.SizeVerCursor)
-        elif edge == (Qt.Edge.TopEdge | Qt.Edge.LeftEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.RightEdge):
-            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-        elif edge == (Qt.Edge.TopEdge | Qt.Edge.RightEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.LeftEdge):
-            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._set_resize_cursor_for_edge(self._get_resize_edge(event.pos()))
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self._set_resize_cursor_for_edge(self._get_resize_edge(event.pos()))
+
+    def leaveEvent(self, event):
+        if self._is_resize_cursor(self.cursor().shape()):
+            self.unsetCursor()
+        super().leaveEvent(event)
 
     def changeEvent(self, event):
         super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.WindowDeactivate,
+            QEvent.Type.WindowStateChange,
+            QEvent.Type.ActivationChange,
+        ) and self._is_resize_cursor(self.cursor().shape()):
+            self.unsetCursor()
         if hasattr(self, "title_bar") and self.title_bar:
             self.title_bar.update_max_restore_button(self.isMaximized())
 
     def closeEvent(self, event):
         self._closing = True
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self._cancel_cover_loading()
         try:
             from malka.ui.image_utils import clear_thumbnail_queue
